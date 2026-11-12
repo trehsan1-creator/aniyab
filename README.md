@@ -1,7 +1,7 @@
 # دستیار هوشمند آنی‌یاب · Aniyab Smart AI Assistant
 
 Production-grade Next.js 14 (App Router) chat surface for **مرکز ملی گمشده‌ها و پیداشده‌های آنی‌یاب**, wired to the
-Laya.Studio Orchestrator (SystemOne gateway → NVIDIA NIM `meta/llama-3.1-8b-instruct`).
+Laya.Studio Orchestrator (SystemOne gateway → NVIDIA NIM `nvidia/nemotron-3.5-bolt-e4b`).
 
 - **Strict RTL / native Persian** — `dir="rtl"`, `lang="fa"`, Peyda (پیدا) `PeydaWebFaNum` self-hosted, Persian numerals ۰-۹
 - **Dark aesthetic** — Midnight Navy `#102333`, Deep Blue glass `#1E3A72`, Signal Orange → Ember `#FF7A00 → #f05327`
@@ -51,7 +51,7 @@ Every response carries `X-Aniyab-Served-By` (`nvidia` / `systemone` / `laya`) an
 | Variable | Purpose |
 | --- | --- |
 | `NVIDIA_API_KEY` | **Required.** `nvapi-…` key from build.nvidia.com — server-side only |
-| `NVIDIA_MODEL` | Defaults to `meta/llama-3.1-8b-instruct` |
+| `NVIDIA_MODEL` | Defaults to `nvidia/nemotron-3.5-bolt-e4b`; a retired id is skipped automatically |
 | `LAYA_SYSTEMONE_ENDPOINT` | Optional SystemOne gateway URL |
 | `LAYA_API_KEY` | Bearer token for SystemOne / Laya inference — **never** prefix with `NEXT_PUBLIC_` |
 | `LAYA_SYSTEMONE_MODE` | `off` (default) · `preflight` · `orchestrate` |

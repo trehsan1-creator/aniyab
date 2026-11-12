@@ -751,8 +751,8 @@ export async function POST(request: Request): Promise<Response> {
         return errorResponse(
           502,
           'UPSTREAM_NOT_FOUND',
-          'مسیر سرویس هوش مصنوعی یافت نشد. لطفاً بعداً تلاش کنید؛ تیم فنی مطلع شد.',
-          { hint: 'CONTACT_SUPPORT', upstreamStatus, sessionId },
+          `مدل هوش مصنوعی در دسترس نیست (کد ${toFaDigits(upstreamStatus)}). لطفاً چند دقیقه بعد دوباره تلاش کنید یا با پشتیبانی ۲۴ ساعته ${SUPPORT_HOTLINE} تماس بگیرید.`,
+          { hint: 'RETRY', upstreamStatus, sessionId },
         );
 
       case 408:
