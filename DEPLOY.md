@@ -65,7 +65,7 @@ vercel --prod
 | --- | --- | --- |
 | `NVIDIA_API_KEY` | کلید `nvapi-…` از build.nvidia.com | Production + Preview (نوع: **Sensitive**) |
 | `NVIDIA_API_ENDPOINT` | `https://integrate.api.nvidia.com/v1/chat/completions` | اختیاری |
-| `NVIDIA_MODEL` | `meta/llama-3.1-8b-instruct` | اختیاری |
+| `NVIDIA_MODEL` | `nvidia/nemotron-3.5-bolt-e4b` | اختیاری |
 
 ### ب) ارکستراسیون (اختیاری) — Laya SystemOne
 
@@ -107,13 +107,37 @@ X-Aniyab-Systemone: off | ok | skipped | failed
 
 ```json
 {
-  "model": "meta/llama-3.1-8b-instruct",
+  "model": "nvidia/nemotron-3.5-bolt-e4b",
   "stream": true,
   "temperature": 0.4,
   "max_tokens": 1024,
   "messages": [{ "role": "system", "content": "<پرامپت جریان فعال>" }, { "role": "user", "content": "…" }],
   "metadata": { "gateway": "systemone", "provider": "nvidia-nim", "flow": "lost-report", "session_id": "…" }
 }
+```
+
+### عیب‌یابی: چرا پیام خطای عمومی می‌گیرم؟
+
+به ترتیب این سه دستور را در مرورگر باز کن (نیازی به کلید در آدرس نیست):
+
+| آدرس | چه چیزی را نشان می‌دهد |
+| --- | --- |
+| `/api/chat` | `providers.nvidia.configured` باید `true` باشد. `false` یعنی `NVIDIA_API_KEY` در آن محیط ست نشده یا deployment بعد از تنظیم آن ساخته نشده. |
+| `/api/chat?probe=1` | تماس واقعی با NVIDIA از داخل خودِ deployment. `status:200` یعنی کلید و مدل هر دو سالم‌اند. `401` کلید نامعتبر · `410/404` مدل بازنشسته یا برای این حساب فعال نیست · `status:"network"` یعنی deployment به اینترنت خروجی نمی‌رسد. |
+| `/api/chat?probe=1&stream=1` | همان تست اما روی مسیر SSE که مرورگر مصرف می‌کند؛ `stream.sawDone:true` و `stream.chars>0` یعنی استریم سالم است. |
+
+سه علت واقعیِ خطا که در همین پروژه دیده شد و اکنون هر سه پوشش داده شده‌اند:
+
+1. **`metadata` در بدنه** — NIM پارامتر ناشناخته را با `400 Validation: Unsupported parameter(s)` رد می‌کند.
+2. **مدل بازنشسته** — `meta/llama-3.1-8b-instruct` در ۲۰۲۶-۰۸-۲۶ از رده خارج شد و NVIDIA `410 Gone` می‌دهد.
+3. **مدلِ فعال‌نشده برای حساب** — برای این حساب اکثر مدل‌ها `404 Not Found for account` می‌دهند؛ تنها سه مدل nemotron-3.5 پاسخ می‌دهند.
+
+`NVIDIA_MODEL` را روی یکی از این سه مقدار مجاز بگذار:
+
+```
+nvidia/nemotron-3.5-bolt-e4b        ← پیش‌فرض (سریع، پاسخ مستقیم)
+nvidia/nemotron-3.5-lightning-30b-a3b
+nvidia/nemotron-3.5-super-vl-120b-a12b
 ```
 
 ### نکتهٔ حیاتی: NVIDIA NIM پارامتر ناشناخته را رد می‌کند
