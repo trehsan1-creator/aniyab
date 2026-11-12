@@ -15,6 +15,7 @@ import { z } from 'zod';
 
 import { getProduct, PRODUCTS } from '@/content/catalog';
 import { OBJECTIONS, matchObjection } from '@/content/objections.fa';
+import { buildPublicDescription, extractArea, extractPrivateMarks } from '@/lib/agent/found-slots';
 import {
   createFoundReport,
   createLostReport,
@@ -438,14 +439,31 @@ export const TOOLS: ToolDefinition[] = [
       const parsed = foundItemSchema.safeParse(raw);
       if (!parsed.success) return invalid('register_found_item', parsed.error.issues[0]?.message);
 
+      /**
+       * A found report is only useful if the identifying marks are stored — they
+       * are the only thing that can later prove ownership. The model often omits
+       * `descriptionPrivate`, which used to produce a record nobody could verify,
+       * so we recover the marks and the place from the public description and,
+       * failing that, from the conversation itself.
+       *
+       * The public text is rebuilt from scratch so a model that helpfully puts
+       * «کیف چرم مشکی» in it cannot leak the very detail a claimant needs.
+       */
+      const source = [parsed.data.descriptionPrivate ?? '', parsed.data.descriptionPublic].join(' ');
+      const recoveredMarks =
+        parsed.data.descriptionPrivate ??
+        extractPrivateMarks(source, parsed.data.itemType) ??
+        null;
+      const area = parsed.data.area ?? extractArea(source) ?? null;
+
       const report = await createFoundReport({
         customerId: ctx.customerId,
         itemType: parsed.data.itemType,
         identifierKind: parsed.data.identifierKind,
         identifier: parsed.data.identifier,
-        descriptionPublic: parsed.data.descriptionPublic,
-        descriptionPrivate: parsed.data.descriptionPrivate ?? null,
-        area: parsed.data.area ?? null,
+        descriptionPublic: buildPublicDescription(parsed.data.itemType, area),
+        descriptionPrivate: recoveredMarks,
+        area,
       });
 
       await logEvent({

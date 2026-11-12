@@ -518,6 +518,15 @@ http
         return nvidiaError(res, 503, 'Service Unavailable', 'SystemOne model routing is down.');
       }
 
+      // `?fail=402` (on the mock's own path) reproduces an exhausted balance so
+      // the degraded path can be exercised locally instead of in production.
+      if ((req.url || '').includes('402') || process.env.MOCK_LAYA_402 === '1') {
+        res.writeHead(402, { 'Content-Type': 'application/json' });
+        return res.end(
+          JSON.stringify({ error: { code: 'no_credits', message: 'Not enough credits for this request.' } }),
+        );
+      }
+
       let parsed;
       try {
         parsed = JSON.parse(body || '{}');

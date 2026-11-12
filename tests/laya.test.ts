@@ -120,3 +120,28 @@ test('LAYA_SYSTEMONE_MODE=off disables the decision layer', () => {
     process.env = saved;
   }
 });
+
+test('the last decision survives across module instances (shared global)', async () => {
+  /**
+   * The bug this pins: Next.js compiles each route into its own bundle, so a
+   * module-level `let` was private to `/api/chat` and `/api/health` always read
+   * `null` — health kept saying "configured-unused" while every real call was
+   * failing with 402.
+   */
+  const saved = { ...process.env };
+  try {
+    process.env.LAYA_SYSTEMONE_ENDPOINT = 'http://127.0.0.1:9/v1/systemone';
+    process.env.LAYA_API_KEY = 'lsk_live_test';
+    delete process.env.LAYA_SYSTEMONE_MODE;
+
+    const { decide, layaLastDecision } = await import('../lib/laya');
+    const started = await decide({ state: 'سلام', questions: { q: { type: 'noul', instructions: 'hi?' } } });
+
+    assert.equal(started.decision, null, 'an unreachable endpoint must not produce a decision');
+    const last = layaLastDecision();
+    assert.ok(last, 'a failed call must still be recorded — silence is what hid the 402');
+    assert.equal(last!.status, 'failed');
+  } finally {
+    process.env = saved;
+  }
+});

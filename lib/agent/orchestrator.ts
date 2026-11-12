@@ -158,6 +158,42 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
           if (result.memory?.length) savedMemories += result.memory.length;
           executed.push({ name: routed.tool, result });
           preToolResults.push({ name: routed.tool, result });
+        } else if (routed.kind === 'need-slot' && routed.slot === 'item-type') {
+          /**
+           * The customer said they found something but not what. Registering
+           * «شیء پیدا‌شده» would produce a record nobody can act on and a
+           * promise (تأیید مالکیت) we could not keep, so we ask one short
+           * question and let the next turn finish the job with the slots it
+           * needs. No model call, no invented item.
+           */
+          trace.push({
+            step: 'router:need-slot',
+            labelFa: 'اطلاعات ناقص — پرسش تکمیلی',
+            ms: 0,
+            detail: routed.reasonFa,
+          });
+          const ask =
+            'چه چیزی پیدا کردی؟ اگر بگویی «چی» بود و «کجا» پیدایش کردی، همین حالا رسید و کد رهگیری صادر می‌کنم. ' +
+            'مثلاً: «یک کیف چرم مشکی در مترو تجریش پیدا کردم».';
+          pushToken(ask);
+          const meta: MetaFrame = {
+            type: 'meta',
+            servedBy: 'router',
+            model: 'deterministic',
+            latencyMs: Date.now() - startedAt,
+            hops: 0,
+            laya: layaMeta(layaTrace, null, null),
+            memory: { recalled: input.customerBrief ? 1 : 0, saved: 0 },
+            ...(input.xray ? { trace } : {}),
+          };
+          push(meta);
+          try {
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          } catch {
+            /* closed */
+          }
+          resolveDone({ meta, text: ask });
+          return;
         } else if (routed.kind === 'memory-clear') {
           /**
            * Deliberately deterministic. «فراموشم کن» is a privacy guarantee, not
@@ -327,13 +363,20 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
           : llmRoute?.tool && llmRoute.confident
             ? llmRoute.tool
             : null;
-        const decisionSource: 'laya' | 'fallback' | 'model' = existingTool
-          ? 'fallback'
-          : chosen
-            ? 'laya'
-            : llmRoute
-              ? 'model'
-              : 'fallback';
+        /**
+         * `laya` means Laya actually answered. Claiming it when the call
+         * failed (a 402, a timeout) would make the X-Ray panel lie about the
+         * very thing it exists to prove, so a failed decision is reported as
+         * `fallback` — the keyword router is what chose in that case.
+         */
+        const decisionSource: 'laya' | 'fallback' | 'model' =
+          existingTool || !layaTrace.answered.length
+            ? 'fallback'
+            : chosen
+              ? 'laya'
+              : llmRoute
+                ? 'model'
+                : 'fallback';
         /** The tool that will actually pre-execute, whichever path chose it. */
         const preToolName = existingTool ?? chosen;
 

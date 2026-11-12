@@ -703,6 +703,55 @@ export async function createFoundReport(params: {
   }
 }
 
+/**
+ * Looks a found report up by its public tracking code (AN-F-…).
+ *
+ * Returns the *public* projection only: `description_private` never leaves the
+ * server, because it is exactly what a false claimant would need. Verification
+ * compares the claim against it server-side.
+ */
+export async function getFoundReportByCode(
+  code: string,
+): Promise<Omit<FoundReport, 'description_private'> & { hasPrivateMarks: boolean } | null> {
+  const normalised = code.trim().toUpperCase();
+  const strip = (r: FoundReport) => {
+    const { description_private, ...pub } = r;
+    return { ...pub, hasPrivateMarks: Boolean(description_private) };
+  };
+
+  const client = sb();
+  if (!client) {
+    const hit = [...memoryStore.found_reports.values()].find(
+      (r) => r.tracking_code.toUpperCase() === normalised,
+    );
+    return hit ? strip(hit) : null;
+  }
+  const { data } = await client
+    .from('found_reports')
+    .select('*')
+    .eq('tracking_code', normalised)
+    .maybeSingle();
+  return data ? strip(data as FoundReport) : null;
+}
+
+/** Server-only: the private marks, for claim verification. Never send to a client. */
+export async function getFoundReportPrivate(code: string): Promise<FoundReport | null> {
+  const normalised = code.trim().toUpperCase();
+  const client = sb();
+  if (!client) {
+    return (
+      [...memoryStore.found_reports.values()].find((r) => r.tracking_code.toUpperCase() === normalised) ??
+      null
+    );
+  }
+  const { data } = await client
+    .from('found_reports')
+    .select('*')
+    .eq('tracking_code', normalised)
+    .maybeSingle();
+  return (data as FoundReport | null) ?? null;
+}
+
 export async function createSecureCall(foundReportId: string, minutes = 15): Promise<SecureCall> {
   const relay = `۰۲۱-۹۱۰۰${Math.floor(1000 + Math.random() * 8999)}`;
   const expires = new Date(Date.now() + minutes * 60_000).toISOString();

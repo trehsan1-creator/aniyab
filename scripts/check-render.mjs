@@ -19,6 +19,17 @@ const CHECKS = [
   // offering a login form — both states are correct, a crash is not.
   { path: '/admin', markers: ['رمز عبور', 'داشبورد تنظیم نشده است'], anyOf: true, name: 'admin gate' },
   { path: '/offline', markers: ['ارتباط اینترنت قطع است'], name: 'offline' },
+  /**
+   * Every receipt prints `/f/AN-F-…`, so this route must exist and must render
+   * the not-found state (not a 404) for an unknown code. It used to not exist at
+   * all, which meant every QR code and every receipt link was dead.
+   */
+  {
+    path: '/f/AN-F-RENDERCHECK',
+    markers: ['این کد پیدا نشد', 'گفتگو با دستیار آنی‌یاب'],
+    name: 'found-item page',
+    expectStatus: 200,
+  },
 ];
 
 const API_CHECKS = [
