@@ -44,7 +44,9 @@
 import { NextResponse } from 'next/server';
 
 import {
+  MODEL_UNAVAILABLE_STATUSES,
   NVIDIA_DEFAULT_ENDPOINT,
+  nvidiaModelChain,
   hasLayaInference,
   hasNvidiaKey,
   readSystemOneHints,
@@ -140,7 +142,7 @@ const MAX_BODY_BYTES = 256 * 1024; // 256 KiB is plenty for 40 turns of text.
 const SUPPORT_HOTLINE = '۰۲۱-۶۲۸۰۱';
 
 /** Fallback label used only when no provider resolves (see /api/chat health). */
-const MODEL = process.env.NVIDIA_MODEL ?? 'meta/llama-3.1-8b-instruct';
+const MODEL: string = nvidiaModelChain(process.env.NVIDIA_MODEL)[0] ?? 'nvidia/llama-3.1-nemotron-70b-instruct';
 
 /* ════════════════════════════════════════════════════════════════════════════
    2. System prompts — one per business flow
@@ -601,6 +603,59 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
+  /* ── 5.8d Retired-model recovery (404 / 410) ────────────────────────────── */
+  // NVIDIA retires models without warning (`410 Gone`, e.g.
+  // meta/llama-3.1-8b-instruct on 2026-08-26). Rather than fail the turn we walk
+  // the live model chain and re-issue the same request, so a retired default can
+  // never take the assistant down.
+  if (
+    !upstream.ok &&
+    (MODEL_UNAVAILABLE_STATUSES as readonly number[]).includes(upstream.status) &&
+    plan.id === 'nvidia'
+  ) {
+    const configured = typeof upstreamPayload.model === 'string' ? upstreamPayload.model : MODEL;
+    const remaining = nvidiaModelChain(configured).filter((m) => m !== configured);
+
+    for (const candidate of remaining) {
+      logUpstream('model_retired_retry', {
+        sessionId,
+        from: configured,
+        to: candidate,
+        status: upstream.status,
+      });
+
+      await upstream.text().catch(() => '');
+
+      const retry = await fetchWithSignal(plan.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream, application/json;q=0.9',
+          ...plan.headers,
+          'X-Request-Id': crypto.randomUUID(),
+        },
+        body: JSON.stringify({ ...upstreamPayload, model: candidate }),
+        cache: 'no-store' as RequestCache,
+      }).catch(() => null);
+
+      if (retry && retry.ok) {
+        upstream = retry;
+        upstreamPayload.model = candidate;
+        logUpstream('model_retired_retry_ok', { sessionId, model: candidate });
+        break;
+      }
+
+      if (retry) {
+        await retry.text().catch(() => '');
+        // Only keep walking while the model itself is the problem.
+        if (!(MODEL_UNAVAILABLE_STATUSES as readonly number[]).includes(retry.status)) {
+          upstream = retry; // real error (auth, rate limit, …) — surface it
+          break;
+        }
+      }
+    }
+  }
+
   /* ── 5.9 SystemOne orchestration → NVIDIA fallback ──────────────────────── */
   // In 'orchestrate' mode SystemOne was called as the model endpoint above.
   // If it is unusable we transparently fall back to NVIDIA so the user still
@@ -1018,7 +1073,10 @@ export async function GET(request: Request): Promise<Response> {
   const ready = hasNvidiaKey() || hasLayaInference();
 
   // Diagnose the live upstream from inside the deployment itself.
-  const wantsProbe = new URL(request.url).searchParams.get('probe') === '1';
+  const probeUrl = new URL(request.url);
+  const wantsProbe = probeUrl.searchParams.get('probe') === '1';
+  // `?model=<id>` lets an operator vet a specific model id from production.
+  const probeModel = probeUrl.searchParams.get('model')?.trim() || null;
   let probe: Record<string, unknown> | undefined;
 
   if (wantsProbe && ready) {
@@ -1036,6 +1094,7 @@ export async function GET(request: Request): Promise<Response> {
           body: JSON.stringify(
             slimPayload({
               ...resolvedProbe.plan.bodyExtras,
+              ...(probeModel ? { model: probeModel } : {}),
               stream: false,
               max_tokens: 16,
               temperature: 0,
@@ -1050,6 +1109,7 @@ export async function GET(request: Request): Promise<Response> {
         probe = {
           attempted: true,
           provider: resolvedProbe.plan.id,
+          model: probeModel ?? resolvedProbe.plan.bodyExtras.model,
           status: res.status,
           ok: res.ok,
           ms: Date.now() - startedProbe,

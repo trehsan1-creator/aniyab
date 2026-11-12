@@ -71,6 +71,50 @@ export const OPENAI_CHAT_FIELDS = [
 /** NVIDIA's hosted NIM gateway (OpenAI-compatible). */
 export const NVIDIA_DEFAULT_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
+/**
+ * Live NVIDIA NIM models, in preference order.
+ *
+ * `meta/llama-3.1-8b-instruct` — the original default — reached end of life on
+ * 2026-08-26 and NVIDIA now answers `410 Gone` for it, which surfaced in the UI
+ * as an unexpected error. The route walks this chain, skipping any model that
+ * reports 404/410, so a retired model can never take the assistant down again.
+ */
+export const NVIDIA_MODEL_CHAIN = [
+  'nvidia/nemotron-3-super-120b-a12b',
+  'nvidia/llama-3.1-nemotron-70b-instruct',
+  'moonshotai/kimi-k2.6',
+  'openai/gpt-oss-20b',
+  'mistralai/mistral-large-2-instruct',
+  'nvidia/nemotron-nano-3-30b-a3b',
+  'google/gemma-4-31b-it',
+] as const;
+
+/** Models the operator may still name explicitly via `NVIDIA_MODEL`. */
+export const NVIDIA_FALLBACK_MODEL = 'nvidia/llama-3.1-nemotron-70b-instruct';
+
+/** Models NVIDIA has retired; never spend a request on them. */
+export const NVIDIA_RETIRED_MODELS = ['meta/llama-3.1-8b-instruct'] as const;
+
+/**
+ * Builds the ordered list of models to try: the operator's choice first (when
+ * it is not retired), then the live chain, de-duplicated.
+ */
+export function nvidiaModelChain(configured?: string | null): string[] {
+  const out: string[] = [];
+  const push = (m?: string | null) => {
+    const v = m?.trim();
+    if (v && !out.includes(v) && !(NVIDIA_RETIRED_MODELS as readonly string[]).includes(v)) {
+      out.push(v);
+    }
+  };
+  push(configured);
+  for (const m of NVIDIA_MODEL_CHAIN) push(m);
+  return out;
+}
+
+/** Status codes NVIDIA uses for "this model id is not usable". */
+export const MODEL_UNAVAILABLE_STATUSES = [404, 410] as const;
+
 export interface ResolveProviderInput {
   /** Per-request override coming from the browser (`provider` in the body). */
   requested?: string | null;
@@ -120,7 +164,7 @@ export function resolveProvider(input: ResolveProviderInput): ResolveProviderRes
     }
 
     const endpoint = process.env.NVIDIA_API_ENDPOINT?.trim() || NVIDIA_DEFAULT_ENDPOINT;
-    const model = process.env.NVIDIA_MODEL?.trim() || 'meta/llama-3.1-8b-instruct';
+    const model = nvidiaModelChain(process.env.NVIDIA_MODEL)[0];
 
     return {
       ok: true,
