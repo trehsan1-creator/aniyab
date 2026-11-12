@@ -17,6 +17,7 @@ import {
   PostShipmentCard,
   ReceiptCard,
   SecureCallCard,
+  TriageNote,
 } from '@/components/cards/misc-cards';
 import { ScannerCard } from '@/components/cards/qr-scanner';
 import { ContextPanel, LayaMark } from '@/components/shell/context-panel';
@@ -805,6 +806,8 @@ function CardRenderer({
       );
     case 'MemoryToast':
       return <MemoryToast text={String(props.text ?? '')} cleared={Boolean(props.cleared)} />;
+    case 'TriageNote':
+      return <TriageNote priority={Number(props.priority ?? 25)} reasonFa={String(props.reasonFa ?? '')} />;
     default:
       return null;
   }

@@ -124,7 +124,16 @@ export function ContextPanel({
             <Cpu className="size-3" aria-hidden /> X-Ray
           </p>
           <dl className="mt-1.5 space-y-1 text-[10px]">
-            <Row label="Laya" value={`${meta.laya.mode} · ${meta.laya.status}`} />
+            <Row
+              label="Laya"
+              value={
+                meta.laya.router
+                  ? `${meta.laya.router.source === 'laya' ? 'تصمیم' : meta.laya.router.source === 'fallback' ? 'جایگزین' : 'به مدل'} · ${meta.laya.router.tool ?? 'none'} · اطمینان ${toFaDigits(meta.laya.router.confidence.toFixed(2))}`
+                  : `${meta.laya.mode} · ${meta.laya.status}`
+              }
+            />
+            {meta.laya.tier ? <Row label="سطح مدل (Laya)" value={meta.laya.tier} /> : null}
+            {meta.laya.error ? <Row label="خطای Laya" value={meta.laya.error} /> : null}
             <Row label="ارائه‌دهنده" value={meta.servedBy} />
             <Row label="مدل" value={meta.model.split('/').slice(-1)[0] ?? meta.model} />
             <Row label="گام‌ها" value={toFaDigits(meta.hops)} />

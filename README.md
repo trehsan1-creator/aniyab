@@ -15,7 +15,9 @@ Laya.Studio Orchestrator (SystemOne gateway → NVIDIA NIM `nvidia/nemotron-3.5-
 | Path | What it is |
 | --- | --- |
 | `app/api/chat/route.ts` | Route Handler (Node runtime): validates, injects the flow system prompt, calls SystemOne (optional), forwards to NVIDIA NIM with `Authorization: Bearer`, pipes `text/event-stream` straight through or normalises `application/json`, maps 401/403/404/429/5xx/timeout to a Persian error contract |
-| `lib/llm.ts` | Provider layer: NVIDIA NIM ⇄ Laya endpoint resolution, credential guards, SystemOne mode + preflight-hint parsing |
+| `lib/llm.ts` | Provider layer: NVIDIA NIM resolution, credential guards, model chain |
+| `lib/laya.ts` | Laya decision-API client: `decide()`, typed answer readers, honest trace |
+| `lib/agent/laya-decisions.ts` | The five decisions: tool routing, model tier, ticket triage, found-item matching, objection detection |
 | `components/AniyabChatInterface.tsx` | `'use client'` chat UI: header + live status, flow tabs, streaming engine, rich answer renderer, copy, auto-scroll, hotline footer |
 | `tailwind.config.ts` | Design tokens: colours, `font-peyda`, gradients, shadows, keyframes/animations |
 | `lib/peyda.ts` | `next/font/local` loader for the Peyda weights (`--font-peyda`) |
@@ -34,19 +36,22 @@ The app talks to **two** upstreams with different jobs:
 | Concern | Upstream | Variables |
 | --- | --- | --- |
 | **Inference** (tokens) | NVIDIA NIM — `integrate.api.nvidia.com/v1/chat/completions` | `NVIDIA_API_KEY` (`nvapi-…`), `NVIDIA_API_ENDPOINT`, `NVIDIA_MODEL` |
-| **Orchestration** (policy/session) | Laya SystemOne — `/v1/systemone` | `LAYA_SYSTEMONE_ENDPOINT`, `LAYA_API_KEY`, `LAYA_SYSTEMONE_MODE` |
+| **Decisions** (routing, tier, triage) | Laya decision API — `/v1/systemone` | `LAYA_SYSTEMONE_ENDPOINT`, `LAYA_API_KEY`, `LAYA_MODEL` |
 
-`LAYA_SYSTEMONE_MODE` selects the topology:
+Laya is a **decision** API, not a chat model: it takes `{state, questions}` and returns calibrated
+probabilities. The assistant asks it five things per turn (see `docs/LAYA_INTEGRATION.md`):
 
-- **`off`** (default) — NVIDIA only; SystemOne is never contacted.
-- **`preflight`** — SystemOne is asked for hints (system prompt, model, temperature) and we then call
-  NVIDIA ourselves. One extra JSON round-trip, lowest blast radius.
-- **`orchestrate`** — SystemOne *is* the model endpoint; if it errors or is unreachable the route
-  transparently falls back to NVIDIA, so the user always gets an answer.
+1. which of the 12 tools should handle this turn (`choice`, threshold `LAYA_TOOL_THRESHOLD`),
+2. whether the turn needs tools at all (`noul`),
+3. how difficult it is → model tier and token budget (`score`),
+4. whether a lost report is urgent / an identity document / a fraud risk (`noul` ×3),
+5. which approved sales objection applies — that label *becomes* the tool argument (`choice`).
 
-Every response carries `X-Aniyab-Served-By` (`nvidia` / `systemone` / `laya`) and
-`X-Aniyab-Systemone` (`off` / `ok` / `skipped` / `failed`) so you can see which path served a turn.
-`GET /api/chat` reports the resolved provider topology without leaking any secret.
+`LAYA_SYSTEMONE_MODE` is `live` (default whenever a key exists) or `off`. Every decision is non-fatal:
+if Laya is unreachable the deterministic router and the model take over. `meta.laya` in the stream
+reports `status`, `answered`, `router.{tool,probability,confident,source}`, `creditsCharged`, and any
+`error` — and `GET /api/health` reports the *last real decision*, so a configured-but-idle
+integration can never look healthy again.
 
 | Variable | Purpose |
 | --- | --- |
@@ -54,15 +59,17 @@ Every response carries `X-Aniyab-Served-By` (`nvidia` / `systemone` / `laya`) an
 | `NVIDIA_MODEL` | Defaults to `nvidia/nemotron-3.5-bolt-e4b`; a retired id is skipped automatically |
 | `LAYA_SYSTEMONE_ENDPOINT` | Optional SystemOne gateway URL |
 | `LAYA_API_KEY` | Bearer token for SystemOne / Laya inference — **never** prefix with `NEXT_PUBLIC_` |
-| `LAYA_SYSTEMONE_MODE` | `off` (default) · `preflight` · `orchestrate` |
-| `LLM_PROVIDER` | `nvidia` (default) or `laya` — switch the inference upstream entirely |
+| `LAYA_SYSTEMONE_MODE` | `live` (default with a key) · `off` |
+| `LAYA_MODEL` | `multilingual` — required for Persian (1024-token context) |
+| `LAYA_TOOL_THRESHOLD` / `LAYA_TIER_THRESHOLD` / `LAYA_URGENCY_THRESHOLD` | `0.70` / `0.65` / `0.60` |
+| `LLM_PROVIDER` | `nvidia` (default); `laya` only for a self-hosted OpenAI-compatible proxy |
 | `LLM_TIMEOUT_MS` | Hard upstream ceiling, defaults to `45000` (keep below `maxDuration`) |
 
 ## 3. Run
 
 ```bash
 npm install
-npm run dev          # http://localhost:3000  (needs a real LAYA_API_ENDPOINT)
+npm run dev          # http://localhost:3000  (needs NVIDIA_API_KEY; Laya is optional)
 npm run dev:demo     # http://localhost:3000  (spawns the local mock orchestrator)
 npm run build        # production build
 npm run typecheck    # tsc --noEmit
@@ -141,7 +148,8 @@ one automatic retry with `slimPayload()` (documented fields only).
 {"messages":[…], "sessionId":"…", "activeFlow":"general", "provider":"laya"}
 
 # globally
-LLM_PROVIDER=laya     # + LAYA_API_ENDPOINT / LAYA_API_KEY
+LAYA_SYSTEMONE_ENDPOINT=https://api.laya.studio/v1/systemone
+LAYA_API_KEY=lsk_live_…   # enables the decision layer
 ```
 
 ## 8. Deploying to Vercel

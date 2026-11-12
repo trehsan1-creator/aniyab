@@ -13,7 +13,8 @@ app/api/chat/route.ts          اعتبارسنجی zod → هویت دستگا�
    ├── lib/agent/router.ts        مسیرساز قطعی (IMEI، کد ملی، «فراموشم کن»، ثبت یافته)
    ├── lib/agent/orchestrator.ts  اجرای ابزار + حلقهٔ مدل (حداکثر ۴ گام)
    │      ├── lib/agent/tools.ts      ۱۳ ابزار zod؛ هیچ‌کدام throw نمی‌کند
-   │      ├── lib/laya.ts             SystemOne preflight (اختیاری)
+   │      ├── lib/laya.ts             کلاینت API تصمیم Laya
+   │      ├── lib/agent/laya-decisions.ts   پنج تصمیم (مسیریابی، سطح مدل، اولویت، تطبیق، تردید)
    │      └── lib/llm.ts              زنجیرهٔ مدل NVIDIA + سقف فیلدها
    ├── lib/agent/extract.ts       استخراج حافظه بعد از flush (waitUntil)
    └── lib/db/store.ts            تنها سطح دسترسی به داده

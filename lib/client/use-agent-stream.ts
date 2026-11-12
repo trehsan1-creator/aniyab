@@ -31,7 +31,26 @@ export interface MetaState {
   model: string;
   latencyMs: number;
   hops: number;
-  laya: { mode: string; status: string; latencyMs: number; hintKeys: string[] };
+  laya: {
+    mode: string;
+    status: string;
+    latencyMs: number;
+    answered: string[];
+    model?: string | null;
+    router?: {
+      tool: string | null;
+      probability: number;
+      confidence: number;
+      confident: boolean;
+      needsTools: number | null;
+      conflicting?: boolean;
+      source: 'laya' | 'fallback' | 'model';
+    } | null;
+    tier?: string | null;
+    error?: string;
+    errorStatus?: number;
+    creditsCharged?: number;
+  };
   memory: { recalled: number; saved: number };
   trace?: Array<{ step: string; labelFa: string; ms: number; detail?: string }>;
 }

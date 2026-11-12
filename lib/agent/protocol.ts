@@ -48,11 +48,34 @@ export interface MetaFrame {
   model: string;
   latencyMs: number;
   hops: number;
+  /** Laya decision-layer trace: what was asked, what came back, what it cost. */
   laya: {
     mode: string;
     status: string;
     latencyMs: number;
-    hintKeys: string[];
+    /** Question ids Laya actually answered this turn. */
+    answered: string[];
+    /** Which checkpoint served it (`multilingual` for Persian). */
+    model?: string | null;
+    /** The decision we acted on, when we acted on one. */
+    router?: {
+      tool: string | null;
+      /** Top option's probability (for display). */
+      probability: number;
+      /** Laya's calibrated confidence — the value the threshold is applied to. */
+      confidence: number;
+      confident: boolean;
+      needsTools: number | null;
+      /** `tool = none` while `needs_tools` is high: the answers disagree. */
+      conflicting?: boolean;
+      /** Where the tool came from: Laya, the keyword fallback, or nobody. */
+      source: 'laya' | 'fallback' | 'model';
+    } | null;
+    /** Model tier Laya asked for, when it was consulted. */
+    tier?: string | null;
+    error?: string;
+    errorStatus?: number;
+    creditsCharged?: number;
   };
   memory: { recalled: number; saved: number };
   /** X-Ray traces, only populated when the client asked for them. */
