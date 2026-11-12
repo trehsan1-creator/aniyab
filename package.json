@@ -17,7 +17,8 @@
     "test:tools": "node scripts/test-tool-calling.mjs",
     "test:e2e": "playwright test tests/smoke.e2e.ts",
     "check:render": "node scripts/check-render.mjs",
-    "verify": "npm run typecheck && npm run test && npm run check:render"
+    "verify": "npm run typecheck && npm run test && npm run check:render",
+    "db:check": "tsx scripts/db-check.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

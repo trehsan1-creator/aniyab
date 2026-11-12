@@ -162,6 +162,13 @@ Short version — import the repo at <https://vercel.com/new>, add `NVIDIA_API_K
 (sensitive) and optionally `NVIDIA_MODEL` / `LAYA_SYSTEMONE_*`, then Deploy. `vercel.json` already pins
 `regions: ["fra1"]` and `maxDuration: 60` for the chat function.
 
+**Database and admin panel are off until you configure them.** Without Supabase the app runs on a
+per-instance in-memory store, which on Vercel means data disappears on every cold start; without
+`ADMIN_PASSWORD` the `/admin` dashboard renders a "not configured" notice. Step-by-step (including the
+`PII_HASH_PEPPER` trap and the anon-key you should *not* set): **[docs/SETUP_DATABASE.md](./docs/SETUP_DATABASE.md)**.
+Verify the result with `npm run db:check` — it checks the connection, all 12 tables, RLS on the
+service-only tables, and Vercel compatibility, without writing anything.
+
 ## 9. Notes for deployment
 
 - The handler runs on the **Node.js** runtime with `maxDuration = 60`, so a slow orchestrator still gets a

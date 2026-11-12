@@ -17,6 +17,8 @@
 import { createClient } from '@supabase/supabase-js';
 import { createHash } from 'node:crypto';
 
+import { loadEnv, required } from './env.mjs';
+
 import {
   DEMO_EXTRA_CUSTOMERS,
   DEMO_NATIONAL_IDS,
@@ -25,9 +27,25 @@ import {
   DEMO_REGISTRY_ITEMS,
 } from '../lib/demo-data';
 
-const URL_ = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const PEPPER = process.env.PII_HASH_PEPPER?.trim() || 'aniyab-demo-pepper-v1';
+// `.env.local` is NOT loaded automatically outside `next` — importing this
+// first is what makes `npm run seed` actually see the credentials.
+loadEnv();
+
+const URL_ = required('NEXT_PUBLIC_SUPABASE_URL');
+const KEY = required('SUPABASE_SERVICE_ROLE_KEY');
+const PEPPER = required('PII_HASH_PEPPER');
+
+/**
+ * The pepper is not cosmetic: national IDs are stored as salted hashes, so a
+ * value that differs from the running app's means every lookup silently misses
+ * (no error, just "not found"). Refuse rather than write unusable hashes.
+ */
+if (URL_ && KEY && !PEPPER) {
+  console.error('✗ PII_HASH_PEPPER is not set.');
+  console.error('  National-ID hashes written now would never match the app.');
+  console.error('  Set it in .env.local (and Vercel) to the same value, then re-run.');
+  process.exit(1);
+}
 
 const RESET = process.argv.includes('--reset');
 
@@ -69,12 +87,36 @@ const OFFICES = ['ولیعصر', 'شهرک غرب', 'تجریش', 'نارمک', 
 async function main() {
   if (!URL_ || !KEY) {
     console.log('⚠️  Supabase is not configured — nothing to seed.');
-    console.log('   Set NEXT_PUBLIC_SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY, or run the');
-    console.log('   app without a database (ephemeral in-memory store).');
+    console.log('   Put NEXT_PUBLIC_SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY in .env.local');
+    console.log('   (this script reads it), or run the app without a database.');
+    console.log('   Check with: npm run db:check');
     return;
   }
 
   const sb = createClient(URL_, KEY, { auth: { persistSession: false } });
+
+  /**
+   * Preflight. Every write used to fail silently: the loop above `continue`d on
+   * the first error, so a wrong key or a missing table produced a cheerful
+   * "✅ seed complete" with zero rows written. Two read-only checks first turn
+   * that into a clear failure.
+   */
+  const auth = await sb.from('customers').select('id', { count: 'exact', head: true });
+  if (auth.error) {
+    console.error(`✗ cannot read \`customers\`: ${auth.error.message}`);
+    console.error('  Either the key is wrong, or 0001_init.sql has not been run.');
+    console.error('  Diagnose with: npm run db:check');
+    process.exit(1);
+  }
+  for (const table of ['lost_reports', 'found_reports', 'registry_entries']) {
+    const res = await sb.from(table).select('*', { count: 'exact', head: true });
+    if (res.error) {
+      console.error(`✗ table \`${table}\` is missing — run all three migrations in order.`);
+      console.error('  Then: npm run db:check');
+      process.exit(1);
+    }
+  }
+  ok('schema reachable');
 
   if (RESET) {
     console.log('🧹 removing previous demo rows…');
@@ -103,6 +145,7 @@ async function main() {
   console.log('👥 seeding customers…');
   const ids = new Map<string, string>();
 
+  let writeFailures = 0;
   for (const p of DEMO_PERSONAS) {
     const { data, error } = await sb
       .from('customers')
@@ -124,6 +167,7 @@ async function main() {
       .single();
     if (error) {
       console.error(`   ${p.fullName}: ${error.message}`);
+      writeFailures += 1;
       continue;
     }
     ids.set(p.key, data.id as string);
@@ -260,11 +304,20 @@ async function main() {
     });
   }
 
+  if (writeFailures) {
+    console.error(`\n✗ seed finished with ${writeFailures} failed write(s) — the data is incomplete.`);
+    console.error('  Nothing below should be trusted. Fix the error above, then re-run.');
+    process.exit(1);
+  }
   console.log('\n✅ seed complete.');
   console.log('   demo personas:');
   for (const p of DEMO_PERSONAS) {
     console.log(`   · ${p.fullName} — ${p.phone} — ${p.visits} visits`);
   }
+}
+
+function ok(msg: string) {
+  console.log(`✓ ${msg}`);
 }
 
 function personaIndex(key: string): number {
