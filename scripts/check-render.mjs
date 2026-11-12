@@ -15,7 +15,9 @@ const CHECKS = [
   { path: '/', markers: ['خرید برچسب', 'اعلام مفقودی'], name: 'chat' },
   { path: '/?demo=1', markers: ['خرید برچسب'], name: 'chat+demo' },
   { path: '/?flow=lost-report', markers: ['خرید برچسب'], name: 'chat+flow' },
-  { path: '/admin', markers: ['رمز عبور'], name: 'admin gate' },
+  // With no ADMIN_PASSWORD the page must say "not configured" instead of
+  // offering a login form — both states are correct, a crash is not.
+  { path: '/admin', markers: ['رمز عبور', 'داشبورد تنظیم نشده است'], anyOf: true, name: 'admin gate' },
   { path: '/offline', markers: ['ارتباط اینترنت قطع است'], name: 'offline' },
 ];
 
@@ -38,7 +40,11 @@ for (const check of CHECKS) {
   }
   const html = await res.text();
   const crashed = html.includes('__next_error__') || html.includes('Application error');
-  const missing = check.markers.filter((m) => !html.includes(m));
+  const missing = check.anyOf
+    ? check.markers.some((m) => html.includes(m))
+      ? []
+      : check.markers
+    : check.markers.filter((m) => !html.includes(m));
   if (res.status !== 200 || crashed || missing.length) {
     console.error(
       `✗ ${check.name} ${check.path} — status=${res.status} crashed=${crashed} missing=${JSON.stringify(missing)}`,

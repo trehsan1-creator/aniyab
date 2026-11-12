@@ -169,6 +169,53 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
 
         /* ── 1b. scripted mode: real tools, canned narration ─────────────── */
         if (input.scripted) {
+          // No model means no chance for the model to pick recommend_product, so
+          // the consultation pillar needs a deterministic path here. This stays
+          // out of the router on purpose: with a live model we want discovery
+          // questions first, not an instant recommendation.
+          if (preToolResults.length === 0 && /(برچسب|آنی\s*پارک|آنی\s*پرو|پیشنهاد|کدام|مناسب)/.test(input.userText)) {
+            const objectType = /لپ\s*تاپ/.test(input.userText)
+              ? 'کیف لپ‌تاپ'
+              : /خودرو|ماشین|پارک/.test(input.userText)
+                ? 'خودرو'
+                : /کیف|کوله|چمدان/.test(input.userText)
+                  ? 'کیف'
+                  : /گوشی/.test(input.userText)
+                    ? 'گوشی موبایل'
+                    : 'شیء همراه';
+            const isVehicle = /خودرو|ماشین|پارک/.test(input.userText);
+            push({
+              type: 'tool',
+              name: 'recommend_product',
+              labelFa: TOOL_PROGRESS_FA.recommend_product ?? 'در حال انتخاب محصول مناسب…',
+              status: 'start',
+            });
+            const t0 = Date.now();
+            const result = await executeTool(
+              'recommend_product',
+              {
+                objectType,
+                recommendedProduct: isVehicle ? 'ani-park' : 'ani-pro',
+                reasonFa: isVehicle
+                  ? 'چون برای خودرو و پارکینگ طراحی شده و چسب آن به شیشه مقاوم است.'
+                  : `چون ${objectType} هر روز با شما بیرون می‌رود و آنی پرو QR اختصاصی با صفحهٔ گزارش گم‌شدن دارد.`,
+                stage: 'recommended',
+              },
+              toolCtx,
+            );
+            trace.push({ step: 'tool:recommend_product', labelFa: 'ابزار recommend_product', ms: Date.now() - t0 });
+            push({
+              type: 'tool',
+              name: 'recommend_product',
+              labelFa: TOOL_PROGRESS_FA.recommend_product ?? 'recommend_product',
+              status: result.ok ? 'ok' : 'error',
+              summaryFa: result.summaryFa,
+            });
+            for (const ui of result.ui ?? []) push({ type: 'ui', card: ui.card, props: ui.props });
+            preToolResults.push({ name: 'recommend_product', result });
+            await new Promise((r) => setTimeout(r, 120));
+          }
+
           const narration = preToolResults.length
             ? scriptedAfterTool(preToolResults.map((p) => p.result))
             : scriptedChitChat(input.userText, input.flow);
