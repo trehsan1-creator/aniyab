@@ -31,7 +31,42 @@ export interface ProviderPlan {
   bodyExtras: Record<string, unknown>;
   /** Human-readable label for /api/chat health output. */
   label: string;
+  /**
+   * NVIDIA NIM validates top-level body keys strictly and answers
+   * `400 Validation: Unsupported parameter(s)` for anything it does not know
+   * (e.g. `metadata`, `client_metadata`, `stream_options` on some routes).
+   * When this is true the route strips every non-OpenAI field before sending.
+   */
+  strictBody: boolean;
 }
+
+/**
+ * The exact set of top-level keys the OpenAI chat-completions schema defines.
+ * Anything else is dropped for strict providers (NVIDIA NIM).
+ */
+export const OPENAI_CHAT_FIELDS = [
+  'model',
+  'messages',
+  'stream',
+  'stream_options',
+  'temperature',
+  'top_p',
+  'max_tokens',
+  'max_completion_tokens',
+  'n',
+  'stop',
+  'presence_penalty',
+  'frequency_penalty',
+  'logit_bias',
+  'logprobs',
+  'top_logprobs',
+  'user',
+  'seed',
+  'response_format',
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+] as const;
 
 /** NVIDIA's hosted NIM gateway (OpenAI-compatible). */
 export const NVIDIA_DEFAULT_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
@@ -100,11 +135,10 @@ export function resolveProvider(input: ResolveProviderInput): ResolveProviderRes
           'X-Aniyab-Flow': input.flow,
           'X-Aniyab-Session': input.sessionId,
         },
-        bodyExtras: {
-          model,
-          // NIM honours `stream_options` for usage accounting in the final frame.
-          stream_options: { include_usage: true },
-        },
+        // Deliberately minimal: NIM rejects keys it does not recognise, so no
+        // `metadata`, no `stream_options` — only the documented chat fields.
+        bodyExtras: { model },
+        strictBody: true,
       },
     };
   }
@@ -134,6 +168,8 @@ export function resolveProvider(input: ResolveProviderInput): ResolveProviderRes
         'X-Aniyab-Session': input.sessionId,
       },
       bodyExtras: { model },
+      // Laya/OpenAI-style gateways tolerate extra routing metadata.
+      strictBody: !endpoint.includes('nvidia'),
     },
   };
 }
@@ -233,4 +269,31 @@ export function readSystemOneHints(payload: unknown): SystemOneHints {
   }
 
   return hints;
+}
+
+/**
+ * The absolute minimum chat-completions body: only fields every
+ * OpenAI-compatible gateway (including strict NVIDIA NIM validation) accepts.
+ */
+export const SLIM_CHAT_FIELDS = [
+  'model',
+  'messages',
+  'stream',
+  'temperature',
+  'top_p',
+  'max_tokens',
+] as const;
+
+/**
+ * Reduces a chat-completions payload to the documented fields only.
+ * Used as the automatic retry body when a strict gateway answers
+ * `400 Validation: Unsupported parameter(s)`.
+ */
+export function slimPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of SLIM_CHAT_FIELDS) {
+    const value = payload[key];
+    if (value !== undefined && value !== null) out[key] = value;
+  }
+  return out;
 }

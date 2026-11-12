@@ -49,6 +49,7 @@ import {
   hasNvidiaKey,
   readSystemOneHints,
   resolveProvider,
+  slimPayload,
   systemOneConfig,
   type ProviderId,
   type SystemOneHints,
@@ -396,6 +397,7 @@ export async function POST(request: Request): Promise<Response> {
         'X-Aniyab-Session': sessionId,
       },
       bodyExtras: plan.bodyExtras,
+      strictBody: false,
     };
   }
   let hints: SystemOneHints = {};
@@ -466,6 +468,19 @@ export async function POST(request: Request): Promise<Response> {
     ? `${FLOW_PROMPTS[activeFlow]}\n\n[دستور تکمیلی SystemOne]\n${hints.system_prompt}`
     : FLOW_PROMPTS[activeFlow];
 
+  /** Routing metadata — only sent to gateways that tolerate extra keys. */
+  const routingMetadata = {
+    gateway: systemOne.enabled ? 'systemone' : 'direct',
+    provider: plan.id === 'nvidia' ? 'nvidia-nim' : 'laya',
+    flow: activeFlow,
+    session_id: sessionId,
+    locale: 'fa-IR',
+    channel: 'aniyab-web',
+    app: 'aniyab-smart-assistant',
+    ...(hints.metadata ?? {}),
+  };
+
+  /** The documented OpenAI chat-completions body — safe for every provider. */
   const upstreamPayload: Record<string, unknown> = {
     ...plan.bodyExtras,
     // A SystemOne hint may pin a different model; the provider default wins otherwise.
@@ -475,17 +490,13 @@ export async function POST(request: Request): Promise<Response> {
     top_p: 0.9,
     max_tokens: hints.max_tokens ?? 1024,
     messages: [{ role: 'system', content: systemPrompt }, ...conversation],
-    metadata: {
-      gateway: systemOne.enabled ? 'systemone' : 'direct',
-      provider: plan.id === 'nvidia' ? 'nvidia-nim' : 'laya',
-      flow: activeFlow,
-      session_id: sessionId,
-      locale: 'fa-IR',
-      channel: 'aniyab-web',
-      app: 'aniyab-smart-assistant',
-      ...(hints.metadata ?? {}),
-    },
   };
+
+  // NVIDIA NIM answers 400 `Validation: Unsupported parameter(s)` for unknown
+  // top-level keys, so strict providers only ever receive the documented fields.
+  if (!plan.strictBody) {
+    upstreamPayload.metadata = routingMetadata;
+  }
 
   /* ── 5.7 Abort plumbing: client disconnect + hard timeout ───────────────── */
   // A plain flag is used instead of `abort(reason)` — some fetch implementations
@@ -533,6 +544,11 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   /* ── 5.8 Call the model provider ────────────────────────────────────────── */
+  // Strict gateways (NVIDIA NIM) answer 400 for any key they do not recognise.
+  // `upstreamPayload` is already stripped to documented fields, but a future
+  // hint could slip an extra key in — so a 400 triggers one automatic retry
+  // with the bare-minimum body before we surface an error to the user.
+
   let upstream: Response;
   try {
     const requestInit: RequestInit & { duplex?: 'half' } = {
@@ -692,6 +708,99 @@ export async function POST(request: Request): Promise<Response> {
           'پاسخ هسته هوشمند دیرتر از حد انتظار رسید. لطفاً دوباره ارسال کنید.',
           { hint: 'RETRY', upstreamStatus, retryAfter, sessionId },
         );
+
+      case 400: {
+        // NVIDIA NIM: `Validation: Unsupported parameter(s): ...` / bad model id.
+        // Most such 400s mean an unrecognised body key, so retry once with the
+        // bare-minimum chat body before failing the turn.
+        const nvidiaEndpoint =
+          process.env.NVIDIA_API_ENDPOINT?.trim() || NVIDIA_DEFAULT_ENDPOINT;
+
+        if (hasNvidiaKey() && plan.endpoint === nvidiaEndpoint) {
+          const slim = await fetchWithSignal(plan.endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'text/event-stream, application/json;q=0.9',
+              ...plan.headers,
+              'X-Request-Id': crypto.randomUUID(),
+            },
+            body: JSON.stringify(slimPayload(upstreamPayload)),
+            cache: 'no-store' as RequestCache,
+          }).catch(() => null);
+
+          if (slim && slim.ok) {
+            logUpstream('strict_body_retry_ok', {
+              sessionId,
+              provider: plan.id,
+              firstStatus: upstreamStatus,
+              ms: Date.now() - startedAt,
+            });
+
+            const retryType = slim.headers.get('content-type') ?? '';
+            if (retryType.includes('text/event-stream')) {
+              return new Response(slim.body, {
+                status: 200,
+                headers: {
+                  'Content-Type': 'text/event-stream; charset=utf-8',
+                  'Cache-Control': 'no-cache, no-transform',
+                  Connection: 'keep-alive',
+                  'X-Accel-Buffering': 'no',
+                  'X-Aniyab-Served-By': plan.id,
+                  'X-Aniyab-Systemone': systemOneStatus,
+                  'X-Aniyab-Retry': 'slim-body',
+                },
+              });
+            }
+
+            const slimJson = (await slim.json().catch(() => null)) as {
+              choices?: Array<{ message?: { content?: string }; delta?: { content?: string } }>;
+              answer?: string;
+            } | null;
+
+            const slimAnswer =
+              slimJson?.choices?.[0]?.message?.content ??
+              slimJson?.choices?.[0]?.delta?.content ??
+              slimJson?.answer ??
+              '';
+
+            if (!slimAnswer.trim()) {
+              logUpstream('strict_body_retry_empty', { sessionId, provider: plan.id });
+            } else {
+              return successJson(slimAnswer, sessionId, activeFlow, startedAt, {
+                'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                'X-Accel-Buffering': 'no',
+                'X-Aniyab-Session': sessionId,
+                'X-Aniyab-Flow': activeFlow,
+                'X-Aniyab-Served-By': servedBy,
+                'X-Aniyab-Systemone': systemOneStatus,
+                'X-Aniyab-Retry': 'slim-body',
+              }, {
+                servedBy,
+                model: typeof upstreamPayload.model === 'string' ? upstreamPayload.model : MODEL,
+                systemOne: systemOneStatus,
+              });
+            }
+          }
+
+          logUpstream('strict_body_retry_failed', {
+            sessionId,
+            provider: plan.id,
+            firstStatus: upstreamStatus,
+            retryStatus: slim?.status ?? 'network',
+            reason: upstreamDetail.slice(0, 300),
+          });
+        }
+
+        return errorResponse(
+          502,
+          'UPSTREAM_ERROR',
+          `درخواست به سرویس هوش مصنوعی پذیرفته نشد (کد ${toFaDigits(400)}).${
+            upstreamMessage ? ` پیام سرویس: ${upstreamMessage.replace(/\.$/, '')}.` : ''
+          } لطفاً چند لحظه بعد دوباره تلاش کنید یا با ${SUPPORT_HOTLINE} تماس بگیرید.`,
+          { hint: 'RETRY', upstreamStatus, sessionId },
+        );
+      }
 
       case 402:
       case 429:
@@ -904,9 +1013,62 @@ function successJson(
    6. Method + health helpers
    ════════════════════════════════════════════════════════════════════════════ */
 
-export async function GET(): Promise<Response> {
+export async function GET(request: Request): Promise<Response> {
   const systemOne = systemOneConfig();
   const ready = hasNvidiaKey() || hasLayaInference();
+
+  // Diagnose the live upstream from inside the deployment itself.
+  const wantsProbe = new URL(request.url).searchParams.get('probe') === '1';
+  let probe: Record<string, unknown> | undefined;
+
+  if (wantsProbe && ready) {
+    const resolvedProbe = resolveProvider({ requested: null, sessionId: 'health-probe', flow: 'general' });
+    if (!resolvedProbe.ok) {
+      probe = { attempted: false, reason: resolvedProbe.reason };
+    } else {
+      const startedProbe = Date.now();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15_000);
+      try {
+        const res = await fetch(resolvedProbe.plan.endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...resolvedProbe.plan.headers },
+          body: JSON.stringify(
+            slimPayload({
+              ...resolvedProbe.plan.bodyExtras,
+              stream: false,
+              max_tokens: 16,
+              temperature: 0,
+              messages: [{ role: 'user', content: 'ping' }],
+            }),
+          ),
+          signal: controller.signal,
+          cache: 'no-store' as RequestCache,
+        });
+
+        const text = await res.text().catch(() => '');
+        probe = {
+          attempted: true,
+          provider: resolvedProbe.plan.id,
+          status: res.status,
+          ok: res.ok,
+          ms: Date.now() - startedProbe,
+          // Bounded: enough to see `Unsupported parameter(s)` / auth errors.
+          body: text.slice(0, 400),
+        };
+      } catch (err) {
+        probe = {
+          attempted: true,
+          provider: resolvedProbe.plan.id,
+          status: 'network',
+          ms: Date.now() - startedProbe,
+          cause: err instanceof Error ? err.message : String(err),
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  }
 
   return NextResponse.json(
     {
@@ -935,6 +1097,9 @@ export async function GET(): Promise<Response> {
         },
       },
       flows: VALID_FLOWS,
+      // `?probe=1` performs a real (tiny, non-streaming) round-trip so a
+      // deployment can be verified end-to-end without leaking any answer text.
+      ...(probe ? { probe } : {}),
       hint: ready
         ? 'POST { messages, sessionId, activeFlow } به این مسیر.'
         : 'هیچ ارائه‌دهنده‌ای تنظیم نشده است: NVIDIA_API_KEY یا LAYA_API_ENDPOINT+LAYA_API_KEY را تنظیم کنید.',
