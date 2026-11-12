@@ -92,6 +92,34 @@ http
       }
       if (body.includes('SLOW_TEST')) return; // never respond → timeout path
 
+      // ── Strict body validation, like the real NIM gateway ──────────────
+      // NIM answers 400 `Validation: Unsupported parameter(s)` for any
+      // top-level key it does not recognise. Distrusting that is what broke
+      // production, so the mock now enforces it.
+      if (url.startsWith('/v1/chat/completions') || url.startsWith('/json-mode')) {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return nvidiaError(res, 400, 'Bad Request', 'Request body is not valid JSON.');
+        }
+        const allowed = new Set([
+          'model', 'messages', 'stream', 'stream_options', 'temperature', 'top_p',
+          'max_tokens', 'max_completion_tokens', 'n', 'stop', 'presence_penalty',
+          'frequency_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'user',
+          'seed', 'response_format', 'tools', 'tool_choice', 'parallel_tool_calls',
+        ]);
+        const unknown = Object.keys(parsed || {}).filter((k) => !allowed.has(k));
+        if (unknown.length) {
+          return nvidiaError(
+            res,
+            400,
+            'Bad Request',
+            `Validation: Unsupported parameter(s): ${unknown.map((k) => `\`${k}\``).join(', ')}`,
+          );
+        }
+      }
+
       // `/json-mode` forces the non-streaming branch (tests the JSON fallback).
       const wantsStream = body.includes('"stream":true') && !url.startsWith('/json-mode');
       if (url.startsWith('/v1/chat/completions') && wantsStream) return sse(res);

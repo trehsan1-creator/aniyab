@@ -116,7 +116,19 @@ X-Aniyab-Systemone: off | ok | skipped | failed
 }
 ```
 
-اگر gateway شما `metadata` را نمی‌پسندد، حذفش کن (خط `metadata` در `app/api/chat/route.ts`).
+### نکتهٔ حیاتی: NVIDIA NIM پارامتر ناشناخته را رد می‌کند
+
+NIM (برخلاف بسیاری از gatewayها) هر کلید ناشناخته در بدنه را با خطای زیر رد می‌کند:
+
+```
+400 Validation: Unsupported parameter(s): `metadata`
+```
+
+به همین دلیل `metadata` **فقط** برای providerهایی فرستاده می‌شود که `strictBody=false` دارند
+(یعنی SystemOne/Laya). برای NVIDIA بدنه فقط شامل فیلدهای مستندِ OpenAI است.
+اگر باز هم ۴۰۰ بدهد، مسیر به‌طور خودکار یک بار با بدنهٔ حداقلی (`slimPayload`) دوباره تلاش می‌کند
+و هدر `X-Aniyab-Retry: slim-body` را برمی‌گرداند.
+
 اگر به‌جای `messages` ساختار `input`/`prompt` می‌خواهد، فقط همان یک آبجکت `upstreamPayload` را عوض کن.
 
 ---
@@ -126,6 +138,12 @@ X-Aniyab-Systemone: off | ok | skipped | failed
 ```bash
 # ۱) سلامت و توپولوژی (configured باید true باشد)
 curl https://<your-app>.vercel.app/api/chat
+
+# ۱-ب) تست واقعیِ سرتاسری از داخل خودِ deployment (بدون لو دادن متن پاسخ)
+curl 'https://<your-app>.vercel.app/api/chat?probe=1'
+#    probe.status باید 200 باشد. اگر 401 دیدی → کلید nvapi نامعتبر/منقضی است.
+#    اگر 400 دیدی → بدنه هنوز پارامتری دارد که NIM قبول نمی‌کند (متن body را بخوان).
+#    اگر status:"network" دیدی → deployment به اینترنت خروجی دسترسی ندارد.
 
 # ۲) استریم واقعی
 curl -N -X POST https://<your-app>.vercel.app/api/chat \

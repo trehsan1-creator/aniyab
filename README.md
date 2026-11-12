@@ -106,6 +106,15 @@ Content-Type: application/json
 | fetch rejected | 502 | `NETWORK` |
 
 `GET /api/chat` returns a health/config probe; `OPTIONS` returns CORS preflight.
+`GET /api/chat?probe=1` additionally performs a real 16-token round-trip to the
+default provider from inside the deployment and reports `probe.status` +
+a bounded body excerpt — the fastest way to tell "key is missing" apart from
+"key is rejected" apart from "NVIDIA dislikes the request body" in production.
+
+NVIDIA NIM validates top-level body keys strictly and answers
+`400 Validation: Unsupported parameter(s)`. Routing metadata is therefore only
+sent to providers with `strictBody === false`; a 400 on the strict path triggers
+one automatic retry with `slimPayload()` (documented fields only).
 
 ## 5. Server-side guardrails
 
