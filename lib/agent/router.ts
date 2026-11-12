@@ -10,12 +10,19 @@
  *  It is intentionally conservative: anything ambiguous is left to the model.
  */
 
+import { extractFoundSlots } from '@/lib/agent/found-slots';
 import { digitsOnly, toEnDigits, validateImei, validateNationalId, validateIranMobile } from '@/lib/validators';
 
 export type RoutedIntent =
   | { kind: 'tool'; tool: string; args: Record<string, unknown>; reasonFa: string }
   | { kind: 'memory-clear'; reasonFa: string }
   | { kind: 'flow-switch'; flow: 'smart-tag' | 'lost-report' | 'found-report' | 'general'; reasonFa: string }
+  /**
+   * A found item whose type we could not identify. We deliberately do not
+   * guess: registering «شیء پیدا‌شده» produces an unusable record and a promise
+   * we cannot keep. The agent asks a clarifying question instead.
+   */
+  | { kind: 'need-slot'; slot: 'item-type'; reasonFa: string }
   | { kind: 'none' };
 
 const FA_NORMALISE = (t: string) => t.replace(/\u064A/g, 'ی').replace(/\u0643/g, 'ک');
@@ -71,34 +78,37 @@ export function routeIntent(rawText: string, opts?: { lastAssistantAskedImei?: b
   // Deterministic so the receipt + secure-call cards always appear, even if the
   // model is having a bad day. Public copy is intentionally vague; the private
   // description is never shown on the public report page.
-  if (/(پیدا کردم|پیداشده|پیدا شده|یافتم|تحویل بدم|تحویل بدهم)/.test(text)) {
-    const itemType = /کیف/.test(text)
-      ? 'کیف'
-      : /گوشی|موبایل/.test(text)
-        ? 'گوشی موبایل'
-        : /کارت ملی/.test(text)
-          ? 'کارت ملی'
-          : /کارت بانکی|بانک/.test(text)
-            ? 'کارت بانکی'
-            : /کلید/.test(text)
-              ? 'کلید'
-              : /عینک/.test(text)
-                ? 'عینک'
-                : /گذرنامه/.test(text)
-                  ? 'گذرنامه'
-                  : 'شیء پیداشده';
+  if (/(پیدا کردم|پیداشده|پیدا شده|یافتم|تحویل بدم|تحویل بدهم|برگردونم)/.test(text)) {
+    /**
+     * Slot filling, not boilerplate. The identifying marks and the place are
+     * the whole point of a found report — without them ownership can never be
+     * verified and a claim cannot be judged. Previously this block passed a
+     * fixed public string and dropped everything the customer said.
+     */
+    const slots = extractFoundSlots(text);
     const serial = /\b[A-Z]{2,5}-?\d{3,}[A-Z0-9-]*\b/.exec(toEnDigits(text))?.[0] ?? null;
+
+    // If the customer did not name the object, ask instead of inventing one.
+    if (!slots.complete) {
+      return {
+        kind: 'need-slot',
+        slot: 'item-type',
+        reasonFa: 'شیء پیدا شده اما نوعش مشخص نیست',
+      };
+    }
+
     return {
       kind: 'tool',
       tool: 'register_found_item',
       args: {
-        itemType,
+        itemType: slots.itemType,
         identifierKind: serial ? 'serial' : 'qr',
         identifier: serial ?? `QR-${Date.now().toString(36).toUpperCase().slice(-6)}`,
-        descriptionPublic: `${itemType} پیدا شد و به دفتر آنی‌یاب تحویل داده شد. برای دریافت، کد رهگیری را ارائه دهید.`,
-        area: 'تهران',
+        descriptionPublic: slots.descriptionPublic,
+        ...(slots.descriptionPrivate ? { descriptionPrivate: slots.descriptionPrivate } : {}),
+        ...(slots.area ? { area: slots.area } : {}),
       },
-      reasonFa: 'درخواست ثبت شیء پیداشده',
+      reasonFa: `ثبت شیء پیداشده (${slots.itemType}${slots.area ? ` · ${slots.area}` : ''})`,
     };
   }
 

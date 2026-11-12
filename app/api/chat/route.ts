@@ -183,6 +183,12 @@ export async function GET(request: Request): Promise<Response> {
    * "the key is present" and "Laya answers our questions": it sends a genuine
    * `{state, questions}` request and reports the probability that comes back.
    */
+  /**
+   * NOTE: this probe spends credits (1 credit = 1 input token). That is fine for
+   * an explicit `?laya=1` from an operator, and wrong for anything periodic — so
+   * /api/health never calls Laya. It reports the last real decision instead, and
+   * `checks.laya.last` is set by this very probe.
+   */
   if (url.searchParams.get('laya') === '1' && laya.enabled) {
     const started = Date.now();
     const { decision, trace } = await decide({

@@ -183,7 +183,28 @@ export interface LayaLastDecision {
   creditsCharged?: number;
 }
 
-let lastDecision: LayaLastDecision | null = null;
+/**
+ * Process-wide, deliberately on `globalThis`.
+ *
+ * A module-level `let` is NOT shared between routes: Next.js compiles each route
+ * into its own bundle, so `/api/chat` recording a decision and `/api/health`
+ * reading it would use two different copies of this module. That is exactly the
+ * bug that made health report "configured-unused" right after a real (402)
+ * decision. Bundles do share the JS global object in Node, so the record lives
+ * there.
+ *
+ * Scope caveat, stated rather than hidden: on Vercel this is per-lambda-instance.
+ * `null` therefore means "not observed in *this* instance", which is why health
+ * labels it `unverified` and never `broken`.
+ */
+const LAST_KEY = Symbol.for('aniyab.laya.lastDecision');
+
+type GlobalWithLaya = typeof globalThis & { [LAST_KEY]?: LayaLastDecision | null };
+const store = globalThis as GlobalWithLaya;
+
+function readLast(): LayaLastDecision | null {
+  return store[LAST_KEY] ?? null;
+}
 
 /**
  * The most recent real call to Laya in this process, or null if nothing has
@@ -191,11 +212,11 @@ let lastDecision: LayaLastDecision | null = null;
  * mistaken for "working".
  */
 export function layaLastDecision(): LayaLastDecision | null {
-  return lastDecision;
+  return readLast();
 }
 
 function remember(trace: LayaTrace): void {
-  lastDecision = {
+  store[LAST_KEY] = {
     at: new Date().toISOString(),
     status: trace.status,
     latencyMs: trace.latencyMs,
