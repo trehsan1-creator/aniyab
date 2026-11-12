@@ -10,21 +10,40 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "dev:demo": "sh scripts/dev-demo.sh",
-    "demo:upstream": "node scripts/mock-laya.cjs"
+    "demo:upstream": "node scripts/mock-laya.cjs",
+    "seed": "tsx scripts/seed.ts",
+    "seed:reset": "tsx scripts/seed.ts --reset",
+    "test": "tsx --test tests/*.test.ts",
+    "test:tools": "node scripts/test-tool-calling.mjs",
+    "test:e2e": "playwright test tests/smoke.e2e.ts",
+    "check:render": "node scripts/check-render.mjs",
+    "verify": "npm run typecheck && npm run test && npm run check:render"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.119.0",
+    "@vercel/functions": "^3.11.1",
+    "framer-motion": "^14.12.0",
+    "jsqr": "^1.4.0",
     "lucide-react": "^0.454.0",
     "next": "^14.2.35",
+    "qrcode": "^1.5.4",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "recharts": "^3.10.1",
+    "server-only": "^0.0.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@types/node": "^20.14.10",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "autoprefixer": "^10.4.19",
     "postcss": "^8.4.39",
     "tailwindcss": "^3.4.10",
+    "tsx": "^4.23.15",
     "typescript": "^5.5.4"
   }
 }
