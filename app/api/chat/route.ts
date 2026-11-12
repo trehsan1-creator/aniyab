@@ -1084,6 +1084,8 @@ export async function GET(request: Request): Promise<Response> {
   const wantsProbe = probeUrl.searchParams.get('probe') === '1';
   // `?model=<id>` lets an operator vet a specific model id from production.
   const probeModel = probeUrl.searchParams.get('model')?.trim() || null;
+  // `?stream=1` exercises the SSE path the browser actually consumes.
+  const streamProbe = probeUrl.searchParams.get('stream') === '1';
   let probe: Record<string, unknown> | undefined;
 
   if (wantsProbe && ready) {
@@ -1097,15 +1099,19 @@ export async function GET(request: Request): Promise<Response> {
       try {
         const res = await fetch(resolvedProbe.plan.endpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...resolvedProbe.plan.headers },
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: streamProbe ? 'text/event-stream' : 'application/json',
+            ...resolvedProbe.plan.headers,
+          },
           body: JSON.stringify(
             slimPayload({
               ...resolvedProbe.plan.bodyExtras,
               ...(probeModel ? { model: probeModel } : {}),
-              stream: false,
-              max_tokens: 16,
+              stream: streamProbe,
+              max_tokens: streamProbe ? 64 : 16,
               temperature: 0,
-              messages: [{ role: 'user', content: 'ping' }],
+              messages: [{ role: 'user', content: streamProbe ? 'سلام، یک جمله کوتاه فارسی بنویس.' : 'ping' }],
             }),
           ),
           signal: controller.signal,
@@ -1116,14 +1122,45 @@ export async function GET(request: Request): Promise<Response> {
         // Reasoning models return content:null + reasoning_content. Flag it so a
         // candidate can be judged without reading the whole body.
         let reasoningOnly: boolean | undefined;
-        try {
-          const parsedProbe = JSON.parse(text) as {
-            choices?: Array<{ message?: { content?: string | null; reasoning_content?: string | null } }>;
+        let streamSummary: Record<string, unknown> | undefined;
+
+        if (streamProbe) {
+          const frames = text.split('\n').filter((l) => l.startsWith('data:'));
+          let streamed = '';
+          let sawDone = false;
+          for (const line of frames) {
+            const payload = line.slice(5).trim();
+            if (payload === '[DONE]') {
+              sawDone = true;
+              continue;
+            }
+            try {
+              const parsedFrame = JSON.parse(payload) as {
+                choices?: Array<{ delta?: { content?: string | null; reasoning_content?: string | null } }>;
+              };
+              streamed += parsedFrame.choices?.[0]?.delta?.content ?? '';
+            } catch {
+              /* ignore malformed frame */
+            }
+          }
+          streamSummary = {
+            frames: frames.length,
+            sawDone,
+            chars: streamed.length,
+            reasoningOnly: !streamed && !sawDone ? true : false,
+            sample: streamed.slice(0, 200),
           };
-          const msg = parsedProbe.choices?.[0]?.message;
-          if (msg) reasoningOnly = !msg.content && Boolean(msg.reasoning_content);
-        } catch {
-          reasoningOnly = undefined;
+          reasoningOnly = !streamed;
+        } else {
+          try {
+            const parsedProbe = JSON.parse(text) as {
+              choices?: Array<{ message?: { content?: string | null; reasoning_content?: string | null } }>;
+            };
+            const msg = parsedProbe.choices?.[0]?.message;
+            if (msg) reasoningOnly = !msg.content && Boolean(msg.reasoning_content);
+          } catch {
+            reasoningOnly = undefined;
+          }
         }
 
         probe = {
@@ -1134,8 +1171,9 @@ export async function GET(request: Request): Promise<Response> {
           ok: res.ok,
           ms: Date.now() - startedProbe,
           ...(reasoningOnly === undefined ? {} : { reasoningOnly }),
+          ...(streamSummary ? { stream: streamSummary } : {}),
           // Bounded: enough to see `Unsupported parameter(s)` / auth errors.
-          body: text.slice(0, 400),
+          body: streamProbe ? undefined : text.slice(0, 400),
         };
       } catch (err) {
         probe = {
