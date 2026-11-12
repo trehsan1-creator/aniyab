@@ -25,11 +25,12 @@
  *  5. Map upstream failures to a stable, Persian-language JSON error contract
  *     (403 / 404 / 429 / 5xx / timeout / network).
  *
- *  Runtime: Edge. It keeps the streaming pipe allocation-free and gives us
- *  zero-cold-start behaviour for the first token. If your Laya deployment needs
- *  Node-only APIs (custom CA, mTLS, `zlib`), swap the two exports below for:
- *      export const runtime = 'nodejs';
- *      export const dynamic = 'force-dynamic';
+ *  Runtime: Node.js. The handler is runtime-agnostic (no `node:` imports), but
+ *  Node + an explicit `maxDuration` gives the stream a much longer ceiling than
+ *  Edge Functions do — important because `LAYA_TIMEOUT_MS` defaults to 45s.
+ *  On Vercel, `maxDuration` must stay above `LAYA_TIMEOUT_MS`.
+ *  Edge is still viable if you lower the upstream timeout:
+ *      export const runtime = 'edge';   // then LAYA_TIMEOUT_MS <= ~25s
  */
 
 import { NextResponse } from 'next/server';
@@ -38,9 +39,17 @@ import { NextResponse } from 'next/server';
    0. Runtime & contract types
    ════════════════════════════════════════════════════════════════════════════ */
 
-export const runtime = 'edge';
+export const runtime = 'nodejs';
+
 /** Never let the CDN cache a conversation turn. */
 export const dynamic = 'force-dynamic';
+
+/**
+ * Hard ceiling for the whole invocation (seconds). Must be greater than
+ * `LAYA_TIMEOUT_MS`, otherwise the platform kills the stream before our own
+ * timeout can return a clean Persian error. Vercel reads this export directly.
+ */
+export const maxDuration = 60;
 
 /** The three commercial flows the assistant is allowed to reason about. */
 export type AniyabFlow =
@@ -551,8 +560,8 @@ export async function POST(request: Request): Promise<Response> {
       headers: {
         ...commonHeaders,
         'Content-Type': 'text/event-stream; charset=utf-8',
-        Connection: 'keep-alive',
-        'Transfer-Encoding': 'chunked',
+        // Transfer-Encoding is deliberately NOT set — the runtime/CDN frames the
+        // response, and a manual value breaks streaming behind some proxies.
       },
     });
   }

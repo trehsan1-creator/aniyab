@@ -14,7 +14,7 @@ Laya.Studio Orchestrator (SystemOne gateway → NVIDIA NIM `meta/llama-3.1-8b-in
 
 | Path | What it is |
 | --- | --- |
-| `app/api/chat/route.ts` | Edge Route Handler: validates, injects the flow system prompt, forwards to Laya with `Authorization: Bearer`, pipes `text/event-stream` straight through or normalises `application/json`, maps 403/404/429/5xx/timeout to a Persian error contract |
+| `app/api/chat/route.ts` | Route Handler (Node runtime): validates, injects the flow system prompt, forwards to Laya with `Authorization: Bearer`, pipes `text/event-stream` straight through or normalises `application/json`, maps 403/404/429/5xx/timeout to a Persian error contract |
 | `components/AniyabChatInterface.tsx` | `'use client'` chat UI: header + live status, flow tabs, streaming engine, rich answer renderer, copy, auto-scroll, hotline footer |
 | `tailwind.config.ts` | Design tokens: colours, `font-peyda`, gradients, shadows, keyframes/animations |
 | `lib/peyda.ts` | `next/font/local` loader for the Peyda weights (`--font-peyda`) |
@@ -100,10 +100,21 @@ Content-Type: application/json
 - Sticky auto-scroll that pauses when the reader scrolls up (with a "آخرین پیام" jump button), `Shift+Enter` newline, stop-generation button, copy-to-clipboard, offline notice with retry.
 - `prefers-reduced-motion` disables all animation.
 
-## 7. Notes for deployment
+## 7. Deploying to Vercel
 
-- The handler runs on the **Edge** runtime. If your Laya deployment needs Node-only APIs (mTLS, custom CA,
-  `zlib`), swap `export const runtime = 'edge'` for `'nodejs'` — nothing else changes.
+See **[DEPLOY.md](./DEPLOY.md)** (Persian) for the full walkthrough: project import, the three environment
+variables, choosing the right `LAYA_API_ENDPOINT`, post-deploy smoke tests, error-code troubleshooting and
+custom domains.
+
+Short version — import the repo at <https://vercel.com/new>, add `LAYA_API_ENDPOINT`, `LAYA_API_KEY`
+(sensitive) and optionally `LAYA_MODEL` / `LAYA_TIMEOUT_MS`, then Deploy. `vercel.json` already pins
+`regions: ["fra1"]` and `maxDuration: 60` for the chat function.
+
+## 8. Notes for deployment
+
+- The handler runs on the **Node.js** runtime with `maxDuration = 60`, so a slow orchestrator still gets a
+  clean 504 instead of being cut off. Edge also works if you drop `LAYA_TIMEOUT_MS` to ~25s
+  (`export const runtime = 'edge'`); nothing else changes.
 - Font files live in `public/fonts/` (Peyda `FaNum` build, weights 300/400/500/600/700/800) and are
   self-hosted, so there is no Google Fonts request from inside Iran.
 - The `.env.local` in this checkout points at the bundled mock so the preview works without credentials;
