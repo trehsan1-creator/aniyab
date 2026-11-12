@@ -80,17 +80,15 @@ export const NVIDIA_DEFAULT_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat
  * reports 404/410, so a retired model can never take the assistant down again.
  */
 export const NVIDIA_MODEL_CHAIN = [
-  'nvidia/nemotron-3-super-120b-a12b',
-  'nvidia/llama-3.1-nemotron-70b-instruct',
-  'moonshotai/kimi-k2.6',
-  'openai/gpt-oss-20b',
-  'mistralai/mistral-large-2-instruct',
-  'nvidia/nemotron-nano-3-30b-a3b',
-  'google/gemma-4-31b-it',
+  // Verified live on this account: real `content`, no reasoning detour, ~300ms.
+  'nvidia/nemotron-3.5-bolt-e4b',
+  // Reasoning models — usable, but they spend the budget on `reasoning_content`.
+  'nvidia/nemotron-3.5-lightning-30b-a3b',
+  'nvidia/nemotron-3.5-super-vl-120b-a12b',
 ] as const;
 
 /** Models the operator may still name explicitly via `NVIDIA_MODEL`. */
-export const NVIDIA_FALLBACK_MODEL = 'nvidia/llama-3.1-nemotron-70b-instruct';
+export const NVIDIA_FALLBACK_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 
 /** Models NVIDIA has retired; never spend a request on them. */
 export const NVIDIA_RETIRED_MODELS = ['meta/llama-3.1-8b-instruct'] as const;

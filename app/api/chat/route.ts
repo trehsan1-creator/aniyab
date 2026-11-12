@@ -989,7 +989,10 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     const parsed = data as {
-      choices?: Array<{ message?: { content?: string }; delta?: { content?: string } }>;
+      choices?: Array<{
+        message?: { content?: string | null; reasoning_content?: string | null };
+        delta?: { content?: string | null; reasoning_content?: string | null };
+      }>;
       answer?: string;
       output?: { text?: string } | string;
       content?: string;
@@ -1002,6 +1005,10 @@ export async function POST(request: Request): Promise<Response> {
       parsed?.answer ??
       (typeof parsed?.output === 'string' ? parsed.output : parsed?.output?.text) ??
       parsed?.content ??
+      // Reasoning models answer in `reasoning_content` when the token budget is
+      // spent on the thinking pass — better than an empty bubble.
+      parsed?.choices?.[0]?.message?.reasoning_content ??
+      parsed?.choices?.[0]?.delta?.reasoning_content ??
       '';
 
     if (!answer.trim()) {
@@ -1106,6 +1113,19 @@ export async function GET(request: Request): Promise<Response> {
         });
 
         const text = await res.text().catch(() => '');
+        // Reasoning models return content:null + reasoning_content. Flag it so a
+        // candidate can be judged without reading the whole body.
+        let reasoningOnly: boolean | undefined;
+        try {
+          const parsedProbe = JSON.parse(text) as {
+            choices?: Array<{ message?: { content?: string | null; reasoning_content?: string | null } }>;
+          };
+          const msg = parsedProbe.choices?.[0]?.message;
+          if (msg) reasoningOnly = !msg.content && Boolean(msg.reasoning_content);
+        } catch {
+          reasoningOnly = undefined;
+        }
+
         probe = {
           attempted: true,
           provider: resolvedProbe.plan.id,
@@ -1113,6 +1133,7 @@ export async function GET(request: Request): Promise<Response> {
           status: res.status,
           ok: res.ok,
           ms: Date.now() - startedProbe,
+          ...(reasoningOnly === undefined ? {} : { reasoningOnly }),
           // Bounded: enough to see `Unsupported parameter(s)` / auth errors.
           body: text.slice(0, 400),
         };
