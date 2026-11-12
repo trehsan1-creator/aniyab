@@ -51,8 +51,16 @@ function greetingFor(hour: number): string {
   return 'شب بخیر';
 }
 
-export function ChatShell({ demoMode, scriptedDefault }: { demoMode: boolean; scriptedDefault: boolean }) {
-  const [flow, setFlow] = useState<FlowKey>('smart-tag');
+export function ChatShell({
+  demoMode,
+  scriptedDefault,
+  initialFlow,
+}: {
+  demoMode: boolean;
+  scriptedDefault: boolean;
+  initialFlow?: FlowKey;
+}) {
+  const [flow, setFlow] = useState<FlowKey>(initialFlow ?? 'smart-tag');
   const [input, setInput] = useState('');
   const [bubbles, setBubbles] = useState<ChatBubble[]>([]);
   const [greeting, setGreeting] = useState<string | null>(null);
@@ -404,10 +412,16 @@ export function ChatShell({ demoMode, scriptedDefault }: { demoMode: boolean; sc
         onClose={() => setDrawerOpen(false)}
         activeDeviceId={deviceId ?? DEMO_PERSONA_LIST[0]!.deviceId}
         onSwitchPersona={(next) => {
+          // Persist BEFORE the reload, otherwise the old identity comes back and
+          // the presenter silently demos the wrong persona.
+          try {
+            window.localStorage.setItem('aniyab:device', next);
+            window.localStorage.setItem('aniyab:persona', next);
+          } catch {
+            /* private mode: the in-memory override still applies this session */
+          }
           setDeviceOverride(next);
           setDrawerOpen(false);
-          // Rebind the tab: a new identity means a new conversation.
-          window.localStorage.setItem('aniyab:device:tab', next);
           window.location.reload();
         }}
         currentVisit={visit}
