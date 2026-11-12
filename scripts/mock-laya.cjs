@@ -493,32 +493,211 @@ http
   })
   .listen(4100, '0.0.0.0', () => console.log('mock NVIDIA NIM on :4100'));
 
-/* ── Laya SystemOne mock (preflight) ─────────────────────────────────────── */
+/* ── Laya SystemOne mock (decision API) ─────────────────────────────────────
+ *  Contract copied from https://laya.studio/docs/api — NOT from our client code.
+ *  Request : { state, questions: { <id>: {type, instructions?, criteria?} },
+ *              model?, lang? }
+ *  Response: { id, model, answers: { <id>: { type, choice|noul|score,
+ *              probabilities, confidence } }, usage, routing }
+ *
+ *  The point of this mock is to be able to run the whole loop with no network.
+ *  It answers by *keyword rules over `state`*, which is exactly what a real
+ *  decision model does cheaply — but the shape is the documented one, so a
+ *  client that regresses to the old `hints` contract fails here instead of
+ *  passing happily.
+ */
 http
   .createServer((req, res) => {
     readBody(req, (body) => {
       const auth = req.headers.authorization || '';
       console.log(`[systemone-mock] ${req.method} ${req.url} auth=${auth.slice(0, 16)}… body=${body.length}B`);
 
-      // /v1/chat/completions in orchestrate mode: deliberately down, so the route
-      // must transparently fall back to NVIDIA.
+      // In orchestrate mode the gateway also proxies chat — keep that path
+      // deliberately down so the route must fall back to NVIDIA.
       if ((req.url || '').startsWith('/v1/chat/completions')) {
         return nvidiaError(res, 503, 'Service Unavailable', 'SystemOne model routing is down.');
       }
 
-      // A preflight response: hints the route may merge into the model call.
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      let parsed;
+      try {
+        parsed = JSON.parse(body || '{}');
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: { code: 'malformed_body', message: 'body is not JSON' } }));
+      }
+
+      // ── validation, mirroring the real API's 422 ────────────────────────
+      const questions = parsed?.questions;
+      if (!parsed?.state || !questions || typeof questions !== 'object' || Object.keys(questions).length === 0) {
+        res.writeHead(422, { 'Content-Type': 'application/json' });
+        return res.end(
+          JSON.stringify({
+            error: {
+              code: 'invalid_question',
+              message: '`state` and a non-empty `questions` object are required.',
+            },
+          }),
+        );
+      }
+      if (!auth.startsWith('Bearer ') && !req.headers['x-api-key']) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: { code: 'unauthorized', message: 'missing API key' } }));
+      }
+
+      /**
+       * The decision is about *this* turn. Older turns are context, so they are
+       * only consulted when the current message carries no signal — otherwise a
+       * stale IMEI from three turns ago would keep winning the routing question.
+       */
+      const stateObj = typeof parsed.state === 'string' ? { message: parsed.state } : parsed.state || {};
+      // Routing questions pass `message`; triage/matching pass structured state.
+      const text = String(stateObj.message ?? JSON.stringify(stateObj));
+      const contextText = JSON.stringify(stateObj.recent ?? '');
+      const answers = {};
+      for (const [id, q] of Object.entries(questions)) {
+        answers[id] = answerQuestion(id, q, text, contextText);
+      }
+
+      const inputTokens = Math.ceil((body.length + text.length) / 4);
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'x-credits-charged': String(inputTokens),
+        'x-free-runs-remaining': '5800',
+        'x-laya-residency': 'ch',
+      });
       res.end(
         JSON.stringify({
-          ok: true,
-          session_id: 'mock',
-          hints: {
-            system_prompt: 'در پاسخ به کاربر، اگر موردی اورژانسی بود ابتدا شماره ۱۱۰ را یادآوری کن.',
-            temperature: 0.3,
-            metadata: { policy: 'aniyab-v1', routed_by: 'systemone' },
-          },
+          id: `mock_${Date.now().toString(36)}`,
+          model: parsed.model || 'multilingual',
+          answers,
+          usage: { input_tokens: inputTokens, output_tokens: Object.keys(questions).length },
+          routing: { language: parsed.lang || 'fa', model: parsed.model || 'multilingual' },
         }),
       );
     });
   })
   .listen(4200, '0.0.0.0', () => console.log('mock Laya SystemOne on :4200'));
+
+/** Picks a label by keyword, then spreads the rest of the mass realistically. */
+function spread(labels, winner, top) {
+  const rest = labels.filter((l) => l !== winner);
+  const remaining = Math.max(0, 1 - top);
+  const each = rest.length ? remaining / rest.length : 0;
+  const probabilities = {};
+  for (const l of labels) probabilities[l] = Number((l === winner ? top : each).toFixed(4));
+  return probabilities;
+}
+
+/**
+ * 1 − normalised entropy, matching the documented definition of `confidence`.
+ * With many options the same top probability yields lower confidence, which is
+ * exactly why gating on the top probability would be wrong.
+ */
+function confidenceOf(probabilities) {
+  const ps = Object.values(probabilities).filter((p) => p > 0);
+  if (ps.length <= 1) return 1;
+  const h = -ps.reduce((sum, p) => sum + p * Math.log(p), 0);
+  return Number((1 - h / Math.log(ps.length)).toFixed(4));
+}
+
+function answerQuestion(id, q, text, context = '') {
+  const type = q?.type || 'choice';
+
+  if (type === 'noul') {
+    const yes =
+      /110|اورژانس|دزد|مفقود|گم شد|گم کردم|کارت ملی|گذرنامه|کارت بانکی|فوری|امروز|استعلام|پیگیری|رهگیری|بررسی|پیدا کردم|\d{10,}/.test(
+        text,
+      );
+    const p = yes ? 0.91 : 0.07;
+    return {
+      type,
+      noul: p,
+      probabilities: { yes: p, no: Number((1 - p).toFixed(2)) },
+      // documented definition for noul
+      confidence: Number(Math.max(p, 1 - p).toFixed(4)),
+      action: { act_probability: 0.99 },
+    };
+  }
+
+  if (type === 'score') {
+    const levels = Array.isArray(q?.criteria) ? q.criteria : ['trivial', 'easy', 'moderate', 'hard'];
+    const long = text.length > 120 || /چرا|چطور|مقایسه|چند|شرایط|تفاوت/.test(text);
+    const score = /سلام|درود|ممنون|مرسی|خداحافظ/.test(text) && text.length < 40 ? 0 : long ? 2 : 1;
+    const probabilities = Object.fromEntries(
+      levels.map((_, i) => [String(i), i === score ? 0.72 : 0.28 / Math.max(1, levels.length - 1)]),
+    );
+    return {
+      type,
+      score,
+      probabilities,
+      confidence: confidenceOf(probabilities),
+      action: { act_probability: 0.99 },
+    };
+  }
+
+  // choice
+  const criteria = q?.criteria && typeof q.criteria === 'object' ? Object.keys(q.criteria) : ['none'];
+
+  // The objection question has its own label set; answer it from its criteria.
+  if (id === 'objection' || (criteria.includes('price') && criteria.includes('privacy'))) {
+    const objectionRules = [
+      [/گران|بودجه|هزینه|ارزان|صرفه/, 'price'],
+      [/شماره‌ام|لو می|حریم|خصوصی|ناشناس/, 'privacy'],
+      [/دوام|خراب|آب|باران|چسب|کیفیت/, 'durability'],
+      [/تماس امن|چطور زنگ|واسط/, 'secure-call'],
+      [/برنگرداند|یابنده.*ندهد|دروغ/, 'dishonest-finder'],
+      [/حیوان|سگ|گربه|بچه|کودک/, 'pets-kids'],
+      [/شهرستان|ارسال|پست/, 'other-cities'],
+      [/تفاوت|فرق|کدام بهتر/, 'difference'],
+    ];
+    const hit = objectionRules.find(([re, label]) => criteria.includes(label) && re.test(text));
+    const winnerLabel = hit ? hit[1] : 'none';
+    const objectionProbabilities = spread(criteria, winnerLabel, winnerLabel === 'none' ? 0.9 : 0.83);
+    return {
+      type,
+      choice: winnerLabel,
+      probabilities: objectionProbabilities,
+      confidence: confidenceOf(objectionProbabilities),
+      action: { act_probability: 0.99 },
+    };
+  }
+
+  const rules = [
+    [/فراموشم کن|پاک کن|حذف کن/, 'forget_customer'],
+    [/\b\d{15}\b|[۰-۹]{15}/, 'validate_imei'],
+    [/استعلام|کد ملی/, 'lookup_registry'],
+    [/پیگیری|کد رهگیری|وضعیت پرونده|پرونده‌ام/, 'get_report_status'],
+    [/پیدا کردم|پیداشده|پیدا شده|یافتم/, 'register_found_item'],
+    [/مفقود|گم شد|گم کردم|گم شده|دزدیده/, 'create_lost_report'],
+    [/تماس امن|بی‌نام/, 'open_secure_call'],
+    [/پست|ارسال/, 'request_found_post'],
+    [/روزنامه|آگهی|پیش‌فاکتور/, 'quote_newspaper_ad'],
+    [/گران|قیمت|چرا اینقدر|بودجه/, 'get_objection_answer'],
+    [/حریم|شماره‌ام لو|خصوصی/, 'get_objection_answer'],
+    [/آنی پارک|آنی پرو|برچسب|پیشنهاد|کدام|مناسب|بخرم/, 'recommend_product'],
+    [/سلام|درود|ممنون|مرسی|خداحافظ/, 'none'],
+  ];
+  let winner = 'none';
+  for (const [re, label] of rules) {
+    if (criteria.includes(label) && re.test(text)) {
+      winner = label;
+      break;
+    }
+  }
+  // Continuation: «آره همون» only makes sense next to the previous turn. Real
+  // Laya uses `state` this way; the mock needs the same ability to be useful.
+  if (winner === 'none' && criteria.includes('recommend_product') && /همون|همان|آره|بله/.test(text) && /برچسب|آنی/.test(context)) {
+    winner = 'recommend_product';
+  }
+  if (!criteria.includes(winner)) winner = criteria[0];
+  const probabilities = spread(criteria, winner, winner === 'none' ? 0.93 : 0.88);
+  return {
+    type,
+    choice: winner,
+    probabilities,
+    confidence: confidenceOf(probabilities),
+    // Documented but deliberately ignored by our client: act_probability reads
+    // ~1.0 for almost everything and is not a usable gate (issue #185).
+    action: { act_probability: 0.99 },
+  };
+}

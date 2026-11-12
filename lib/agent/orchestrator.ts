@@ -6,7 +6,14 @@ import { parseUpstreamDelta, type AgentFrame, type MetaFrame } from '@/lib/agent
 import { executeTool, openAiToolSpecs, type ToolContext, type ToolResult } from '@/lib/agent/tools';
 import { routeIntent } from '@/lib/agent/router';
 import { scriptedAfterTool, scriptedChitChat } from '@/lib/agent/scripted';
-import { applyLayaHints, layaPreflight, type LayaTrace } from '@/lib/laya';
+import {
+  routeTurn,
+  tierForTurn,
+  triageTicket,
+  LAYA_THRESHOLDS,
+  type ModelTier,
+} from '@/lib/agent/laya-decisions';
+import { traceOf, layaConfig, type LayaTrace } from '@/lib/laya';
 import { MODEL_UNAVAILABLE_STATUSES, nvidiaModelChain, resolveProvider, slimPayload } from '@/lib/llm';
 
 /**
@@ -15,7 +22,7 @@ import { MODEL_UNAVAILABLE_STATUSES, nvidiaModelChain, resolveProvider, slimPayl
  * ─────────────────────────────────────────────────────────────────────────────
  *  Flow per turn:
  *    1. deterministic router  → may pre-execute one tool (reliable path)
- *    2. Laya preflight        → policy/session hints (optional, non-fatal)
+ *    2. Laya decides          → which tool + how hard (non-fatal; see laya-decisions)
  *    3. model call with tools → native tool_calls if supported, else the JSON
  *                               action envelope, else plain narration
  *    4. loop (≤ MAX_HOPS)     → tool results appended as `role: "tool"`
@@ -111,15 +118,19 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
       let hops = 0;
       let servedBy = 'nvidia';
       let modelName = '';
-      let layaTrace: LayaTrace = {
-        mode: 'off',
-        configured: false,
-        status: 'off',
-        latencyMs: 0,
-        endpoint: null,
-        hintKeys: [],
-      };
+      let layaTrace: LayaTrace = traceOf(layaConfig());
+      /** The routing decision we actually acted on, for the meta frame. */
+      let layaRouter: NonNullable<MetaFrame['laya']['router']> | null = null;
+      let layaTier: ModelTier['tier'] | null = null;
+      /**
+       * Generation budget per tier. With one verified model on the account we
+       * cannot always switch models, so the tier still costs less by spending
+       * fewer tokens: a «سلام» does not need a 900-token answer.
+       */
+      const generation = { temperature: 0.4, max_tokens: 900 };
       let savedMemories = 0;
+      /** Every tool executed this turn, model-chosen or not — feeds triage. */
+      const executed: Array<{ name: string; result: ToolResult }> = [];
 
       try {
         /* ── 1. deterministic router ─────────────────────────────────────── */
@@ -145,25 +156,43 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
           });
           for (const ui of result.ui ?? []) push({ type: 'ui', card: ui.card, props: ui.props });
           if (result.memory?.length) savedMemories += result.memory.length;
+          executed.push({ name: routed.tool, result });
           preToolResults.push({ name: routed.tool, result });
         } else if (routed.kind === 'memory-clear') {
+          /**
+           * Deliberately deterministic. «فراموشم کن» is a privacy guarantee, not
+           * a judgement call — it must never depend on a network round-trip
+           * succeeding, so Laya is not consulted and the tool runs immediately.
+           * Laya's `tool` criteria still list `forget_customer` so the model-side
+           * route agrees with this path when it *is* consulted.
+           */
+          const t0 = Date.now();
           const result = await executeTool('forget_customer', {}, toolCtx);
+          trace.push({
+            step: 'tool:forget_customer',
+            labelFa: 'ابزار forget_customer',
+            ms: Date.now() - t0,
+            detail: 'مسیر قطعی حفظ حریم خصوصی (بدون Laya)',
+          });
           push({ type: 'memory', status: 'cleared', summaryFa: result.summaryFa });
           pushToken('همه‌چیز درباره شما پاک شد. از اینجا یک شروع تازه داریم 🌱');
-          push({ type: 'done' } as unknown as AgentFrame);
-          controller.close();
-          resolveDone({
-            meta: {
-              type: 'meta',
-              servedBy: 'router',
-              model: 'deterministic',
-              latencyMs: Date.now() - startedAt,
-              hops: 0,
-              laya: { mode: layaTrace.mode, status: layaTrace.status, latencyMs: 0, hintKeys: [] },
-              memory: { recalled: 0, saved: 0 },
-            },
-            text: visibleText,
-          });
+          const meta: MetaFrame = {
+            type: 'meta',
+            servedBy: 'router',
+            model: 'deterministic',
+            latencyMs: Date.now() - startedAt,
+            hops: 0,
+            laya: layaMeta(layaTrace, null, null),
+            memory: { recalled: 0, saved: 0 },
+            ...(input.xray ? { trace } : {}),
+          };
+          push(meta);
+          try {
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          } catch {
+            /* closed */
+          }
+          resolveDone({ meta, text: visibleText });
           return;
         }
 
@@ -212,6 +241,7 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
               summaryFa: result.summaryFa,
             });
             for (const ui of result.ui ?? []) push({ type: 'ui', card: ui.card, props: ui.props });
+            executed.push({ name: 'recommend_product', result });
             preToolResults.push({ name: 'recommend_product', result });
             await new Promise((r) => setTimeout(r, 120));
           }
@@ -239,7 +269,7 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
             model: 'scripted',
             latencyMs: Date.now() - startedAt,
             hops: preToolResults.length ? 1 : 0,
-            laya: { mode: layaTrace.mode, status: 'skipped', latencyMs: 0, hintKeys: [] },
+            laya: layaMeta(layaTrace, null, null),
             memory: { recalled: 0, saved: savedMemories },
             ...(input.xray ? { trace } : {}),
           });
@@ -252,7 +282,7 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
               model: 'scripted',
               latencyMs: Date.now() - startedAt,
               hops: preToolResults.length ? 1 : 0,
-              laya: { mode: layaTrace.mode, status: 'skipped', latencyMs: 0, hintKeys: [] },
+              laya: layaMeta(layaTrace, null, null),
               memory: { recalled: 0, saved: savedMemories },
             },
             text: narration,
@@ -260,21 +290,123 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
           return;
         }
 
-        /* ── 2. Laya preflight ───────────────────────────────────────────── */
+        /* ── 2. Laya decides: which tool, how hard ───────────────────────── */
+        // Two questions in parallel, both single forward passes on Laya:
+        //   • routeTurn   → which of the 13 tools handles this turn
+        //   • tierForTurn → how hard the turn is, so a greeting does not pay
+        //                   for a 120B-parameter call
+        // Parallel on purpose: each is ~30–100 ms and they share no state.
         const layaStart = Date.now();
-        const { hints, trace: lt } = await layaPreflight({
-          sessionId: input.sessionId,
-          flow: input.flow,
-          messages: input.history.map((h) => ({ role: h.role, content: h.content })),
-          customerBrief: input.customerBrief,
-        });
-        layaTrace = lt;
+        const existingTool = preToolResults[0]?.name ?? null;
+        const [routing, tiering] = await Promise.all([
+          routeTurn({
+            message: input.userText,
+            flow: input.flow,
+            recentUserTurns: input.history.filter((h) => h.role === 'user').map((h) => h.content),
+          }),
+          tierForTurn({ message: input.userText, flow: input.flow, hasTools: Boolean(existingTool) }),
+        ]);
+        layaTrace = mergeTraces(routing.trace, tiering.trace);
+        layaTier = tiering.tier?.tier ?? null;
+        if (layaTier) {
+          generation.max_tokens = layaTier === 'fast' ? 320 : layaTier === 'deep' ? 1200 : 900;
+        }
+
+        const llmRoute = routing.routed;
+        /**
+         * Priority, not a coin flip:
+         *   1. the keyword router only when it already *executed* something
+         *      (an IMEI or a national ID in the text is a fact, not a judgement);
+         *   2. otherwise Laya, when it clears its threshold — this is the normal
+         *      path, and it is what lets the assistant act on turns no regex
+         *      anticipated (objection handling, found-item registration, …);
+         *   3. otherwise the model, which can still call any tool natively.
+         */
+        const chosen = existingTool
+          ? null
+          : llmRoute?.tool && llmRoute.confident
+            ? llmRoute.tool
+            : null;
+        const decisionSource: 'laya' | 'fallback' | 'model' = existingTool
+          ? 'fallback'
+          : chosen
+            ? 'laya'
+            : llmRoute
+              ? 'model'
+              : 'fallback';
+        /** The tool that will actually pre-execute, whichever path chose it. */
+        const preToolName = existingTool ?? chosen;
+
+        if (llmRoute) {
+          layaRouter = {
+            tool: chosen ?? llmRoute.tool,
+            probability: llmRoute.probability,
+            confidence: llmRoute.confidence,
+            confident: llmRoute.confident,
+            needsTools: llmRoute.needsTools,
+            source: decisionSource,
+          };
+        }
+
         trace.push({
-          step: 'laya:preflight',
-          labelFa: `Laya SystemOne (${lt.mode})`,
+          step: 'laya:route',
+          labelFa: `Laya — تصمیم‌گیری (${layaTrace.mode})`,
           ms: Date.now() - layaStart,
-          detail: lt.status,
+          detail: llmRoute
+            ? `${llmRoute.tool ?? 'none'} · p=${llmRoute.probability.toFixed(2)} · ` +
+              `اطمینان ${llmRoute.confidence.toFixed(2)} ` +
+              `(آستانه ${LAYA_THRESHOLDS.tool}) · ` +
+              `${llmRoute.conflicting ? 'ناسازگاری needs_tools ' : ''}` +
+              `${existingTool ? '· روتر کلیدواژه زودتر اجرا کرد' : chosen ? '· اجرا شد' : '· به مدل سپرده شد'} · ${layaTrace.status}`
+            : `پاسخ نداد (${layaTrace.error ?? layaTrace.status})؛ مسیر جایگزین`,
         });
+        if (tiering.tier) {
+          trace.push({
+            step: 'laya:tier',
+            labelFa: 'Laya — انتخاب سطح مدل',
+            ms: tiering.trace.latencyMs,
+            detail: `${tiering.tier.tier} · سختی ${tiering.tier.difficulty.toFixed(2)}`,
+          });
+        }
+
+        /* Pre-execute the tool Laya chose, with arguments from the keyword
+           router's slot filling when it happens to agree. The model still sees
+           the real result and narrates it. */
+        if (chosen && llmRoute) {
+          const preTool = chosen;
+          const args = argsForTool(preTool, {
+            text: input.userText,
+            flow: input.flow,
+            objection: llmRoute.objection,
+          });
+          if (args) {
+            push({
+              type: 'tool',
+              name: preTool,
+              labelFa: TOOL_PROGRESS_FA[preTool] ?? 'در حال انجام…',
+              status: 'start',
+            });
+            const t0 = Date.now();
+            const result = await executeTool(preTool, args, toolCtx);
+            trace.push({
+              step: `tool:${preTool}`,
+              labelFa: `ابزار ${preTool}`,
+              ms: Date.now() - t0,
+              detail: `انتخاب Laya، p=${llmRoute.probability.toFixed(2)}`,
+            });
+            push({
+              type: 'tool',
+              name: preTool,
+              labelFa: TOOL_PROGRESS_FA[preTool] ?? preTool,
+              status: result.ok ? 'ok' : 'error',
+              summaryFa: result.summaryFa,
+            });
+            for (const ui of result.ui ?? []) push({ type: 'ui', card: ui.card, props: ui.props });
+            if (result.memory?.length) savedMemories += result.memory.length;
+            executed.push({ name: preTool, result });
+            preToolResults.push({ name: preTool, result });
+          }
+        }
 
         /* ── 3. build the prompt ─────────────────────────────────────────── */
         const extras: string[] = [];
@@ -286,7 +418,13 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
           customerBrief: input.customerBrief,
           extras,
         });
-        systemPrompt = applyLayaHints(systemPrompt, hints, '');
+        // The routing decision is context the model should not have to re-derive.
+        if (layaRouter?.tool && decisionSource === 'laya') {
+          systemPrompt +=
+            `\n\n[تصمیم لایهٔ مسیریابی: ابزار ${layaRouter.tool} با احتمال ` +
+            `${layaRouter.probability.toFixed(2)} انتخاب و اجرا شد. نتیجهٔ واقعی در ادامه آمده؛ ` +
+            `همان را توضیح بده و ابزار دیگری را بی‌دلیل صدا نزن.]`;
+        }
         if (input.envelopeMode) systemPrompt += `\n\n${ACTION_ENVELOPE_INSTRUCTION}`;
 
         /* ── 4. resolve provider ─────────────────────────────────────────── */
@@ -305,9 +443,27 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
 
         const plan = resolved.plan;
         servedBy = plan.id === 'nvidia' ? 'nvidia' : 'laya';
-        const chain = plan.id === 'nvidia' ? nvidiaModelChain(process.env.NVIDIA_MODEL) : [String(plan.bodyExtras.model)];
+        /**
+         * Model tier from Laya's difficulty score. `nvidiaModelChain` still
+         * provides the ordered fallback, so a tier never removes an option —
+         * it only decides which model gets the first request. When Laya is
+         * unavailable the chain is used as-is (the previous behaviour).
+         */
+        const chain =
+          plan.id === 'nvidia'
+            ? tierChain(layaTier, nvidiaModelChain(process.env.NVIDIA_MODEL))
+            : [String(plan.bodyExtras.model)];
+        const chainStart = chain[0] ?? '';
         let model = chain[0] ?? '';
         modelName = model;
+        if (layaTier && chainStart !== nvidiaModelChain(process.env.NVIDIA_MODEL)[0]) {
+          trace.push({
+            step: 'model:tier',
+            labelFa: 'سطح مدل طبق Laya',
+            ms: 0,
+            detail: `${layaTier} → ${chainStart}`,
+          });
+        }
 
         /* Pre-executed tool results are injected as a tool message so the model
            narrates what really happened instead of inventing a result. */
@@ -338,9 +494,9 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
             model,
             messages,
             stream: true,
-            temperature: hints.temperature ?? 0.4,
+            temperature: generation.temperature,
             top_p: 0.9,
-            max_tokens: hints.max_tokens ?? 900,
+            max_tokens: generation.max_tokens,
           };
           // Native tool calling only for gateways that accept the field. NVIDIA
           // NIM is strict, but `tools`/`tool_choice` are documented OpenAI keys,
@@ -404,6 +560,7 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
               push({ type: 'tool', name: toolName, labelFa: TOOL_PROGRESS_FA[toolName] ?? 'در حال انجام…', status: 'start' });
               const t0 = Date.now();
               const result = await executeTool(toolName, env.action.args ?? {}, toolCtx);
+              executed.push({ name: toolName, result });
               trace.push({ step: `tool:${toolName}`, labelFa: `ابزار ${toolName}`, ms: Date.now() - t0 });
               push({
                 type: 'tool',
@@ -464,7 +621,8 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
                 args = {};
               }
               const t0 = Date.now();
-              const result = await executeTool(tc.name, args, toolCtx);
+              const result = await executeTool(tc.name, args as Record<string, unknown>, toolCtx);
+              executed.push({ name: tc.name, result });
               trace.push({ step: `tool:${tc.name}`, labelFa: `ابزار ${tc.name}`, ms: Date.now() - t0 });
               push({
                 type: 'tool',
@@ -511,18 +669,24 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
           pushToken(finalText);
         }
 
+        /* Laya triages a lost report we just created — cheap, and it turns the
+           admin queue into a priority list instead of a chart. */
+        const triage = await triageIfLostReport(executed, input, trace);
+        if (triage.priority !== null) {
+          push({
+            type: 'ui',
+            card: 'TriageNote',
+            props: { priority: triage.priority, reasonFa: triage.reasonFa },
+          });
+        }
+
         const meta: MetaFrame = {
           type: 'meta',
           servedBy,
           model: modelName,
           latencyMs: Date.now() - startedAt,
           hops,
-          laya: {
-            mode: layaTrace.mode,
-            status: layaTrace.status,
-            latencyMs: layaTrace.latencyMs,
-            hintKeys: layaTrace.hintKeys,
-          },
+          laya: layaMeta(layaTrace, layaRouter, layaTier),
           memory: { recalled: input.customerBrief ? 1 : 0, saved: savedMemories },
           ...(input.xray ? { trace } : {}),
         };
@@ -563,6 +727,39 @@ export function createAgentTurn(input: AgentTurnInput): AgentTurnResult {
 
 /* ── helpers ───────────────────────────────────────────────────────────────── */
 
+/**
+ * Laya triages a lost report *after* it is created: item type plus what the
+ * customer said is enough to score urgency, whether it is an identity document,
+ * and the fraud risk. The result rides on the tool card so the admin queue can
+ * sort on it, and it is traced so the decision is auditable.
+ */
+async function triageIfLostReport(
+  executed: Array<{ name: string; result: ToolResult }>,
+  input: AgentTurnInput,
+  trace: TraceStep[],
+): Promise<{ priority: number | null; reasonFa: string | null }> {
+  const lost = executed.find((e) => e.name === 'create_lost_report' && e.result.ok);
+  if (!lost) return { priority: null, reasonFa: null };
+
+  const data = (lost.result.data ?? {}) as { itemType?: string; lastSeenPlace?: string | null };
+  const t0 = Date.now();
+  const { triage, trace: t } = await triageTicket({
+    itemType: data.itemType ?? 'نامشخص',
+    place: data.lastSeenPlace ?? null,
+    description: input.userText.slice(0, 400),
+  });
+  trace.push({
+    step: 'laya:triage',
+    labelFa: 'Laya — اولویت‌بندی پرونده',
+    ms: Date.now() - t0,
+    detail: triage
+      ? `اولویت ${triage.priority} · فوریت ${triage.urgency.toFixed(2)}` +
+        `${triage.isIdentityDocument ? ' · مدرک هویتی' : ''} · ${t.status}`
+      : `پاسخ نداد (${t.error ?? t.status})`,
+  });
+  return triage ? { priority: triage.priority, reasonFa: triage.reasonFa } : { priority: null, reasonFa: null };
+}
+
 function emptyMeta(startedAt: number, laya: LayaTrace): MetaFrame {
   return {
     type: 'meta',
@@ -570,9 +767,101 @@ function emptyMeta(startedAt: number, laya: LayaTrace): MetaFrame {
     model: '',
     latencyMs: Date.now() - startedAt,
     hops: 0,
-    laya: { mode: laya.mode, status: laya.status, latencyMs: laya.latencyMs, hintKeys: laya.hintKeys },
+    laya: layaMeta(laya, null, null),
     memory: { recalled: 0, saved: 0 },
   };
+}
+
+/** The Laya block of the meta frame — one shape, every call site. */
+function layaMeta(
+  t: LayaTrace,
+  router: NonNullable<MetaFrame['laya']['router']> | null,
+  tier: ModelTier['tier'] | null,
+): MetaFrame['laya'] {
+  return {
+    mode: t.mode,
+    status: t.status,
+    latencyMs: t.latencyMs,
+    answered: t.answered,
+    model: t.model,
+    ...(router ? { router } : {}),
+    ...(tier ? { tier } : {}),
+    ...(t.error ? { error: t.error } : {}),
+    ...(t.errorStatus ? { errorStatus: t.errorStatus } : {}),
+    ...(typeof t.creditsCharged === 'number' ? { creditsCharged: t.creditsCharged } : {}),
+  };
+}
+
+/**
+ * Two Laya calls per turn (routing + difficulty). Merge them honestly: the
+ * worse status wins, latencies add up, and answered question ids are unioned so
+ * X-Ray shows the full picture rather than the last call.
+ */
+function mergeTraces(a: LayaTrace, b: LayaTrace): LayaTrace {
+  const rank: Record<LayaTrace['status'], number> = { ok: 0, skipped: 1, off: 2, failed: 3 };
+  const worst = rank[a.status] >= rank[b.status] ? a : b;
+  const live = a.status === 'ok' ? a : b.status === 'ok' ? b : worst;
+  return {
+    ...worst,
+    latencyMs: a.latencyMs + b.latencyMs,
+    answered: Array.from(new Set([...a.answered, ...b.answered])),
+    model: live.model ?? worst.model,
+    ...(typeof live.creditsCharged === 'number' ? { creditsCharged: live.creditsCharged } : {}),
+  };
+}
+
+/**
+ * Tier → model order. Nothing is dropped: the chosen tier is moved to the front
+ * and the rest of the live chain stays behind it as the fallback that protects
+ * the demo from a retired model. `NVIDIA_MODEL_FAST` opts in to a cheaper
+ * checkpoint; without it the tier only affects the token budget.
+ */
+function tierChain(tier: ModelTier['tier'] | null, chain: string[]): string[] {
+  const fast = process.env.NVIDIA_MODEL_FAST?.trim();
+  if (!tier || !fast) return chain;
+  // `fast` is an explicit operator choice; without it we cannot safely assume a
+  // cheaper model exists, so the tier only affects *which* chain entry goes first.
+  const ordered = [fast, ...chain.filter((m) => m !== fast)];
+  return tier === 'fast' ? ordered : chain;
+}
+
+/**
+ * Arguments for a Laya-chosen tool.
+ *
+ * Laya decides *which* tool, not with what arguments — slot filling is a
+ * different skill. Rather than guess, we ask the deterministic router for slots
+ * and only accept them when they carry real data (a validated IMEI, a phone
+ * number, a national ID). `null` means "don't pre-execute; let the model call
+ * the tool with arguments it extracts from the conversation".
+ */
+function argsForTool(
+  tool: string,
+  ctx: { text: string; flow: string; objection?: string | null },
+): Record<string, unknown> | null {
+  const routed = routeIntent(ctx.text);
+  if (routed.kind === 'tool' && routed.tool === tool) return routed.args;
+  switch (tool) {
+    case 'get_report_status':
+      // No arguments needed; the status tool reads the bound customer's reports.
+      return {};
+    case 'get_objection_answer':
+      /**
+       * This is the professional case: Laya's calibrated label IS the argument.
+       * `objection` is one of the ids in content/objections.fa.ts, so the
+       * approved answer is fetched without any keyword matching by the model.
+       */
+      return ctx.objection ? { topic: ctx.objection } : null;
+    case 'validate_imei':
+    case 'lookup_registry':
+    case 'create_lost_report':
+    case 'register_found_item':
+    case 'quote_newspaper_ad':
+    case 'open_secure_call':
+      // These need real slot data we could not extract — defer to the model.
+      return null;
+    default:
+      return null;
+  }
 }
 
 async function callModel(

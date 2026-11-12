@@ -1,104 +1,145 @@
-# اتصال به Laya.Studio — دقیقاً کجا و چطور
+# اتصال به Laya.Studio — لایهٔ تصمیم، نه تولید متن
 
-> اصل راهنما: **مدل از NVIDIA، ارکستراسیون از Laya، و هیچ‌کدام اجباری نیست.**
-> اگر `LAYA_*` تنظیم نشود، همه‌چیز کار می‌کند؛ فقط لایهٔ سیاست حذف می‌شود.
+> اصل راهنما: **مدل زبانی NVIDIA جمله می‌سازد؛ Laya تصمیم می‌گیرد.**
+> Laya یک API تصمیم (decision API) است: `{state, questions}` می‌فرستیم و
+> احتمال کالیبره‌شدهٔ هر گزینه را می‌گیریم. هیچ‌وقت متن تولید نمی‌کند، پس
+> «مدل زبانی دوم» نیست و نباید برای نوشتن پاسخ استفاده شود.
 
 ## ۱. تفکیک مسئولیت
 
 | لایه | فراهم‌کننده | فایل |
 |---|---|---|
-| استنتاج (LLM) | NVIDIA NIM — `integrate.api.nvidia.com/v1/chat/completions` | `lib/llm.ts` |
-| سیاست/راهنمای پیش از پاسخ | Laya SystemOne — `api.laya.studio/v1/systemone` | `lib/laya.ts` |
-| ابزارها و گردش‌کار | خودمان (`lib/agent/tools.ts`) | — |
+| تصمیم (مسیریابی، اولویت، تطبیق) | Laya SystemOne — `api.laya.studio/v1/systemone` | `lib/laya.ts`, `lib/agent/laya-decisions.ts` |
+| استنتاج و نگارش پاسخ | NVIDIA NIM — `integrate.api.nvidia.com/v1/chat/completions` | `lib/llm.ts` |
+| ابزارها و گردش‌کار | خودمان | `lib/agent/tools.ts` |
 | داده | Supabase | `lib/db/store.ts` |
 
-## ۲. سه حالت Laya
+## ۲. چرا نسخهٔ قبلی کار نمی‌کرد (ریشه‌یابی)
+
+سه لایه خطا، و هر سه در سکوت شکست می‌خوردند:
+
+1. **بدنهٔ درخواست غلط:** `{session_id, flow, locale, channel, messages, context}` می‌فرستادیم.
+   Laya فقط `{state, questions}` می‌پذیرد؛ بقیه ۴۰۰/۴۲۲ می‌گیرد.
+2. **پارس پاسخ غلط:** منتظر `hints.{system_prompt,temperature,max_tokens}` بودیم.
+   پاسخ واقعی `answers.<id>.{choice,noul,score,probabilities,confidence}` است.
+3. **مدل پیش‌فرض غلط:** پیش‌فرض Laya برای متن انگلیسی `english` است؛ فارسی به
+   `multilingual` نیاز دارد.
+
+و دو عامل که خطا را پنهان می‌کردند: مسیر `fallback` بی‌صدا بود، و
+`scripts/mock-laya.cjs` همان `hints` ساختگی را برمی‌گرداند — یعنی تست‌ها با
+همان قرارداد غلط سبز می‌شدند. **درس:** شکل پاسخ را از مستندات کپی کن، نه از کلاینت.
+
+## ۳. تنظیمات
 
 ```bash
-LAYA_MODE=off          # هیچ فراخوانی‌ای انجام نمی‌شود (پیش‌فرض وقتی کلید نیست)
-LAYA_MODE=preflight    # یک POST قبل از مدل؛ خروجی = hints (پیشنهاد)
-LAYA_MODE=orchestrate  # Laya در مسیر تصمیم قرار می‌گیرد؛ در صورت خطا، fallback به NVIDIA
+LAYA_SYSTEMONE_ENDPOINT=https://api.laya.studio/v1/systemone
+LAYA_SYSTEMONE_MODE=live        # live | off
+LAYA_MODEL=multilingual         # فارسی = multilingual (۱۰۲۴ توکن، ۱۰۰+ زبان)
+LAYA_SYSTEMONE_TIMEOUT_MS=4000
+LAYA_API_KEY=lsk_live_…
+LAYA_TOOL_THRESHOLD=0.70        # آستانهٔ اجرای خودکار ابزار
+LAYA_TIER_THRESHOLD=0.65
+LAYA_URGENCY_THRESHOLD=0.60
 ```
 
-`orchestrate` عمداً شکست‌پذیر است: اگر SystemOne خطا بدهد، درخواست **بی‌صدا** به NVIDIA می‌رود و `meta.servedBy` مقدار `nvidia` می‌گیرد. هیچ کاربری خطای Laya نمی‌بیند.
+اگر کلید یا endpoint نباشد، `enabled=false` و همه‌چیز به مسیر قطعی برمی‌گردد.
+هیچ نوبتی به‌خاطر Laya شکست نمی‌خورد (`decide()` هرگز throw نمی‌کند).
 
-## ۳. جریان یک نوبت
+## ۴. پنج تصمیم حرفه‌ای
 
-```
-POST /api/chat
-  → router (قطعی: IMEI / کد ملی / فراموشم کن / ثبت یافته)
-  → layaPreflight({ sessionId, flow, messages, customerBrief })
-        ← { hints: { system_prompt?, temperature?, max_tokens?, metadata }, trace }
-  → buildSystemPrompt(flow, customerBrief, extras)
-  → applyLayaHints(prompt, hints)      ← hint فقط «تقویت» می‌کند، جایگزین نمی‌کند
-  → حلقهٔ مدل با tools
-  → meta.trace  → پنل X-Ray
-```
+### ۴.۱ مسیریابی ابزار — `routeTurn()`
+یک سؤال `choice` روی ۱۲ ابزار + `none`، همراه با `needs_tools` و `category`.
+اگر بالاترین احتمال از `LAYA_TOOL_THRESHOLD` بیشتر بود، ابزار **قبل از مدل** اجرا
+می‌شود و نتیجهٔ واقعی به مدل داده می‌شود تا فقط روایتش کند.
 
-## ۴. قرارداد SystemOne
+### ۴.۲ انتخاب سطح مدل — `tierForTurn()`
+یک سؤال `score` با چهار سطح. `trivial` → `fast` (بودجهٔ ۳۲۰ توکن)،
+`moderate` → `standard` (۹۰۰)، `hard` → `deep` (۱۲۰۰). با
+`NVIDIA_MODEL_FAST` می‌توان یک مدل ارزان‌تر هم به ابتدای زنجیره آورد.
+
+### ۴.۳ اولویت‌بندی پرونده — `triageTicket()`
+سه سؤال `noul`: فوریت، مدرک هویتی بودن، ریسک سوءاستفاده. خروجی روی کارت
+`TriageNote` و در صف ادمین استفاده می‌شود. کارت ملی و گذرنامه اول صف می‌روند
+چون نوع متفاوتی از خطر هستند.
+
+### ۴.۴ تطبیق شیء پیداشده — `matchFoundItem()`
+توضیح خصوصی یابنده در برابر توضیح مالک؛ `noul` کالیبره + کدام ویژگی برای
+تأیید مالکیت قابل استناد است. بالای ۰٫۸۵ = اطلاع‌رسانی خودکار، پایین‌تر = داوری انسانی.
+
+### ۴.۵ تشخیص تردید خرید — `detectObjection()`
+یک سؤال `choice` روی هشت تردید مصوب. **برچسب خودش آرگومان است:** همان شناسه
+به `get_objection_answer(topic)` می‌رود، پس مدل دیگر موضوع را حدس نمی‌زند.
+(`price`, `privacy`, `durability`, `secure-call`, `dishonest-finder`, `pets-kids`,
+`other-cities`, `difference`)
+
+## ۵. قرارداد API
 
 درخواست:
 
 ```json
 {
-  "session_id": "…",
-  "flow": "smart-tag | lost-report | found-report | general",
-  "messages": [{ "role": "user", "content": "…" }],
-  "customer_brief": "…≤۴۰۰ توکن…",
-  "metadata": { "app": "aniyab-smart-assistant", "version": 2 }
+  "state": { "message": "کارت ملی‌ام را گم کردم", "flow": "lost-report" },
+  "questions": {
+    "tool": { "type": "choice", "instructions": "…", "criteria": { "create_lost_report": "…", "none": "…" } },
+    "needs_tools": { "type": "noul", "instructions": "…" },
+    "difficulty": { "type": "score", "criteria": ["trivial: …", "easy: …", "moderate: …", "hard: …"] }
+  },
+  "model": "multilingual",
+  "lang": "fa"
 }
 ```
 
-پاسخ مورد انتظار (همه فیلدها اختیاری):
+پاسخ:
 
 ```json
 {
-  "ok": true,
-  "hints": {
-    "system_prompt": "…",
-    "temperature": 0.3,
-    "max_tokens": 900,
-    "metadata": { "policy": "aniyab-v1" }
-  }
+  "id": "…", "model": "multilingual",
+  "answers": {
+    "tool": { "type": "choice", "choice": "create_lost_report",
+              "probabilities": { "create_lost_report": 0.88, "none": 0.12 }, "confidence": 0.88 },
+    "needs_tools": { "type": "noul", "noul": 0.91 },
+    "difficulty": { "type": "score", "score": 1 }
+  },
+  "usage": { "input_tokens": 118, "output_tokens": 3 }
 }
 ```
 
-نگاشت به `trace`:
+هدرهای مهم: `x-credits-charged` (۱ اعتبار = ۱ توکن ورودی)، `x-free-runs-remaining`،
+`x-laya-residency`. خطاها: `400` بدنهٔ خراب، `401` کلید، `402` اعتبار تمام،
+`422` سؤال نامعتبر، `429` محدودیت نرخ، `503` موقتاً در دسترس نیست.
 
-| وضعیت | معنا در X-Ray |
+⚠️ `POST /v1/ask` را استفاده نکن: آن یک LLM planner است با هزینهٔ ۳ تا ۱۸ اعتبار
+**به‌ازای هر توکن پرامپت**. تصمیم‌گیری مسیریابی را با `systemone` انجام می‌دهیم.
+
+## ۶. حالت `off` (fallback)
+
+اگر Laya نباشد یا خطا بدهد:
+
+```
+router قطعی (IMEI / کد ملی / فراموشم کن / ثبت یافته)  ← همان رفتار نسخهٔ قبل
+مدل با tools، بدون تصمیم قبلی                          ← مدل خودش ابزار را انتخاب می‌کند
+```
+
+`meta.laya` همیشه صادق است: `mode`, `status`, `latencyMs`, `answered`,
+`router.{tool,probability,confident,source}`, `error`, `creditsCharged`.
+`source` یکی از `laya` (تصمیم گرفت)، `fallback` (روتر قطعی)، یا `model` است.
+
+## ۷. اندازه‌گیری
+
+| سؤال | زمان (مدل multilingual) |
 |---|---|
-| `ok` | hints رسید و اعمال شد |
-| `skipped` | کلید/اندپوینت نیست یا mode=`off` |
-| `failed` | خطای شبکه/۴۰۱/۴۲۹ — نادیده گرفته شد و مسیر ادامه یافت |
-| `off` | عمداً خاموش |
+| یک سؤال | ~۳۳ms |
+| پنج سؤال | ~۸۵ms |
 
-## ۵. آنچه هرگز از Laya نمی‌پذیریم
+در عمل حدود ۵ms در محیط لوکال و ۲ تا ۳ درصد تأخیر کل نوبت. هر نوبت دو فراخوانی
+موازی دارد (مسیریابی + سختی) و در مجموع زیر ۱۰ms.
 
-- **ابزار جدید**: Laya نمی‌تواند ابزار تزریق کند؛ فهرست ابزارها در `lib/agent/tools.ts` بسته است.
-- **دسترسی داده**: هیچ کوئری‌ای از سمت Laya اجرا نمی‌شود.
-- **متن خام بدون فیلتر**: `hint.system_prompt` فقط به انتهای prompt اضافه می‌شود؛ `SAFETY_RULES_FA` همیشه آخر می‌ماند و بازنویسی نمی‌شود.
+## ۸. تست
 
-## ۶. اجرای محلی بدون کلید
-
-```bash
-npm run demo:upstream     # mock روی :4100 (NVIDIA) و :4200 (SystemOne)
-```
-
-سپس در `.env.local`:
-
-```bash
-NVIDIA_API_URL=http://127.0.0.1:4100/v1/chat/completions
-LAYA_API_ENDPOINT=http://127.0.0.1:4200/v1/systemone
-LAYA_MODE=preflight
-```
-
-mock سه چیز را شبیه‌سازی می‌کند: tool calling سازگار با OpenAI، پاسخ preflight با hints، و خطاهای NVIDIA (`RATE_TEST`، `AUTH_TEST`، `NOTFOUND_TEST`، `BOOM_TEST`، `SLOW_TEST`).
-
-## ۷. بررسی سالم بودن
-
-```bash
-curl -s localhost:3000/api/health | jq .checks.laya
-# { "mode": "preflight", "configured": true, "endpointHost": "api.laya.studio" }
-```
-
-و در هر نوبت با `xray: true`، فیلد `meta.laya` دقیقاً همان چیزی است که در پنل کنار گفتگو دیده می‌شود — همان جایی که «Powered by Laya.Studio» نوشته شده است.
+- `tests/laya.test.ts` — قرارداد پاسخ (`readChoice`/`readNoul`/`readScore`)،
+  نرمال‌سازی، حالت `off`.
+- `tests/laya-decisions.test.ts` — وقتی Laya نیست، هر سه تصمیم `null` می‌دهند
+  و خطا نمی‌دهند.
+- `scripts/mock-laya.cjs` — قرارداد مستند را پیاده می‌کند (نه قرارداد کلاینت)،
+  و درخواست بدون `state`/`questions` را با ۴۲۲ رد می‌کند.
+- `scripts/probe-turn.py` — یک نوبت واقعی می‌فرستد و `meta` + `trace` را چاپ می‌کند.

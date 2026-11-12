@@ -14,6 +14,7 @@ import {
   QrCode,
   Receipt,
   SearchX,
+  ShieldAlert,
 } from 'lucide-react';
 
 import { jalaliDate } from '@/lib/pricing';
@@ -410,6 +411,41 @@ export function MemoryToast({ text, cleared }: { text: string; cleared?: boolean
       <p className="text-[11px] text-emerald-100">
         {cleared ? text : `برای دفعه بعد یادم می‌مونه: ${text}`}
       </p>
+    </motion.aside>
+  );
+}
+
+/**
+ * TriageNote — Laya's priority verdict for a lost report.
+ *
+ * A card, not a tooltip: the customer is told what happens next, and the same
+ * number is what the admin queue sorts on. Shown after `create_lost_report`.
+ */
+export function TriageNote({ priority, reasonFa }: { priority: number; reasonFa: string }) {
+  // priority is 0..25, lower = look first (see triageTicket in laya-decisions).
+  const urgent = priority <= 5;
+  return (
+    <motion.aside
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={[
+        'flex w-full items-start gap-2 rounded-xl border px-3 py-2',
+        urgent
+          ? 'border-rose-400/30 bg-rose-500/[0.08]'
+          : 'border-white/10 bg-white/[0.04]',
+      ].join(' ')}
+      aria-live="polite"
+    >
+      <ShieldAlert
+        className={`mt-0.5 size-3.5 shrink-0 ${urgent ? 'text-rose-300' : 'text-slate-400'}`}
+        aria-hidden
+      />
+      <div className="space-y-0.5">
+        <p className={`text-[11px] font-semibold ${urgent ? 'text-rose-100' : 'text-slate-200'}`}>
+          {urgent ? 'پرونده در اولویت بررسی قرار گرفت' : 'پرونده ثبت و اولویت‌بندی شد'}
+        </p>
+        <p className="text-[10.5px] leading-5 text-slate-400">{reasonFa}</p>
+      </div>
     </motion.aside>
   );
 }

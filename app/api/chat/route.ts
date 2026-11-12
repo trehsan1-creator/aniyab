@@ -13,7 +13,7 @@ import {
   saveMessage,
   logEvent,
 } from '@/lib/db/store';
-import { layaConfig } from '@/lib/laya';
+import { decide, layaConfig, readChoice } from '@/lib/laya';
 import { hasLayaInference, hasNvidiaKey, nvidiaModelChain, NVIDIA_DEFAULT_ENDPOINT } from '@/lib/llm';
 
 /**
@@ -85,7 +85,12 @@ export async function GET(request: Request): Promise<Response> {
         },
       },
       orchestration: {
-        systemone: { configured: laya.enabled, mode: laya.mode, endpoint: laya.endpoint },
+        systemone: {
+          configured: laya.enabled,
+          status: laya.enabled ? 'live' : 'off',
+          model: laya.model,
+          endpoint: laya.endpoint,
+        },
       },
     },
     storage: { supabase: supabaseConfigured(), mode: supabaseConfigured() ? 'supabase' : 'ephemeral' },
@@ -171,6 +176,36 @@ export async function GET(request: Request): Promise<Response> {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * `?laya=1` → one real decision round-trip. This is the difference between
+   * "the key is present" and "Laya answers our questions": it sends a genuine
+   * `{state, questions}` request and reports the probability that comes back.
+   */
+  if (url.searchParams.get('laya') === '1' && laya.enabled) {
+    const started = Date.now();
+    const { decision, trace } = await decide({
+      state: 'کارت ملی‌ام را در مترو گم کردم',
+      questions: {
+        tool: {
+          type: 'choice',
+          instructions: 'کدام ابزار باید اول اجرا شود؟',
+          criteria: { create_lost_report: 'ثبت مفقودی', none: 'هیچ‌کدام' },
+        },
+      },
+    });
+    const top = readChoice(decision?.answers.tool);
+    payload.layaProbe = {
+      attempted: true,
+      status: trace.status,
+      ms: Date.now() - started,
+      model: trace.model,
+      choice: top?.label ?? null,
+      probability: top?.probability ?? null,
+      creditsCharged: trace.creditsCharged ?? null,
+      ...(trace.error ? { error: trace.error, errorStatus: trace.errorStatus } : {}),
+    };
   }
 
   return NextResponse.json(payload, { headers: { 'Cache-Control': 'no-store' } });

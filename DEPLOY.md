@@ -46,7 +46,7 @@ npm i -g vercel
 vercel login
 cd aniyab
 vercel link                     # اتصال به پروژه (نام: aniyab)
-vercel env add LAYA_API_ENDPOINT production
+vercel env add LAYA_SYSTEMONE_ENDPOINT production
 vercel env add LAYA_API_KEY production
 vercel --prod
 ```
@@ -73,7 +73,8 @@ vercel --prod
 | --- | --- | --- |
 | `LAYA_SYSTEMONE_ENDPOINT` | آدرس SystemOne، مثلاً `https://api.laya.studio/v1/systemone` | اختیاری |
 | `LAYA_API_KEY` | توکن Bearer لایا | اختیاری (نوع: **Sensitive**) |
-| `LAYA_SYSTEMONE_MODE` | `off` (پیش‌فرض) یا `preflight` یا `orchestrate` | اختیاری |
+| `LAYA_SYSTEMONE_MODE` | `live` (پیش‌فرض وقتی کلید هست) یا `off` | اختیاری |
+| `LAYA_MODEL` | `multilingual` — برای فارسی الزامی است | اختیاری |
 | `LLM_TIMEOUT_MS` | `45000` | اختیاری — باید **کمتر** از `maxDuration` باشد |
 
 سه قاعده‌ی طلایی:
@@ -84,15 +85,21 @@ vercel --prod
 
 ---
 
-## ۳. سه حالت اتصال به SystemOne
+## ۳. نقش Laya
 
-`LAYA_SYSTEMONE_MODE` تعیین می‌کند SystemOne چه نقشی داشته باشد:
+**Laya یک API تصمیم است، نه مدل زبانی.** ورودی `{state, questions}` و خروجی احتمال
+کالیبره برای هر گزینه؛ متن تولید نمی‌کند و `/chat/completions` هم ندارد. جزئیات کامل
+در `docs/LAYA_INTEGRATION.md`.
 
 | حالت | چه اتفاقی می‌افتد | چه زمانی |
 | --- | --- | --- |
-| `off` | فقط NVIDIA. لایا هیچ تماسی نمی‌گیرد. | وقتی SystemOne آماده نیست |
-| `preflight` | اول از SystemOne راهنمای پرامپت/مدل می‌گیریم، بعد خودمان NVIDIA را صدا می‌زنیم | **پیشنهاد شروع** — کم‌ریسک‌ترین |
-| `orchestrate` | خود SystemOne مدل را صدا می‌زند؛ اگر خطا داد، خودکار روی NVIDIA fallback می‌شود | وقتی می‌خواهی لایا مالک فراخوانی باشد |
+| `off` | فقط NVIDIA و روتر قطعی. لایا هیچ تماسی نمی‌گیرد. | وقتی کلید نیست |
+| `live` | هر نوبت: مسیریابی ابزار + سطح مدل؛ پس از ثبت مفقودی: اولویت‌بندی | **پیش‌فرض** |
+
+برای تأیید اینکه واقعاً تصمیم می‌گیرد، `GET /api/health` را ببین: فیلد
+`checks.laya.last` آخرین تصمیم واقعی را نشان می‌دهد (`status`, `latencyMs`, `answered`,
+`creditsCharged`). اگر `null` بود یعنی هنوز هیچ تصمیمی گرفته نشده — حتی اگر
+`configured: true` باشد.
 
 برای دیدن اینکه هر درخواست با کدام مسیر جواب داده شده، هدرهای پاسخ را ببین:
 
@@ -214,7 +221,7 @@ curl -N -X POST https://<your-app>.vercel.app/api/chat \
 
 - [ ] `NVIDIA_API_KEY` حتماً server-side و از نوع Sensitive
 - [ ] `LLM_TIMEOUT_MS` < `maxDuration`
-- [ ] `LAYA_SYSTEMONE_MODE` روی مقدار عمدی (`off` یا `preflight`)
+- [ ] `LAYA_SYSTEMONE_MODE` روی مقدار عمدی (`off` یا `live`) و `LAYA_MODEL=multilingual`
 - [ ] `GET /api/chat` روی Production مقدار `configured` بدهد
 - [ ] یک گفتگو روی موبایل واقعی (فونت پیدا + RTL)
 - [ ] متن پرامپت‌های جریان‌ها با واحد کسب‌وکار نهایی شده باشد (قیمت‌ها و شماره‌ها در `FLOW_PROMPTS`)
