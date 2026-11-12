@@ -324,6 +324,15 @@ export const SLIM_CHAT_FIELDS = [
   'temperature',
   'top_p',
   'max_tokens',
+  // Documented OpenAI keys the agent REQUIRES. Omitting them here silently
+  // disabled tool calling in production once — keep them whitelisted.
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+  'response_format',
+  'stop',
+  'seed',
+  'user',
 ] as const;
 
 /**
