@@ -57,12 +57,24 @@ vercel --prod
 
 ## ۲. متغیرهای محیطی (مهم‌ترین بخش)
 
+معماری دو لایه است، پس دو گروه متغیر داریم:
+
+### الف) استنتاج (اجباری) — NVIDIA NIM
+
 | کلید | مقدار | محیط |
 | --- | --- | --- |
-| `LAYA_API_ENDPOINT` | آدرس کامل gateway لایا | Production + Preview |
-| `LAYA_API_KEY` | توکن Bearer | Production + Preview (نوع: **Sensitive**) |
-| `LAYA_MODEL` | `meta/llama-3.1-8b-instruct` | اختیاری |
-| `LAYA_TIMEOUT_MS` | `45000` | اختیاری — باید **کمتر** از `maxDuration` باشد |
+| `NVIDIA_API_KEY` | کلید `nvapi-…` از build.nvidia.com | Production + Preview (نوع: **Sensitive**) |
+| `NVIDIA_API_ENDPOINT` | `https://integrate.api.nvidia.com/v1/chat/completions` | اختیاری |
+| `NVIDIA_MODEL` | `meta/llama-3.1-8b-instruct` | اختیاری |
+
+### ب) ارکستراسیون (اختیاری) — Laya SystemOne
+
+| کلید | مقدار | محیط |
+| --- | --- | --- |
+| `LAYA_SYSTEMONE_ENDPOINT` | آدرس SystemOne، مثلاً `https://api.laya.studio/v1/systemone` | اختیاری |
+| `LAYA_API_KEY` | توکن Bearer لایا | اختیاری (نوع: **Sensitive**) |
+| `LAYA_SYSTEMONE_MODE` | `off` (پیش‌فرض) یا `preflight` یا `orchestrate` | اختیاری |
+| `LLM_TIMEOUT_MS` | `45000` | اختیاری — باید **کمتر** از `maxDuration` باشد |
 
 سه قاعده‌ی طلایی:
 
@@ -72,15 +84,24 @@ vercel --prod
 
 ---
 
-## ۳. آدرس درست `LAYA_API_ENDPOINT`
+## ۳. سه حالت اتصال به SystemOne
 
-روت ما با هر دو حالت کنار می‌آید و بر اساس `Content-Type` تصمیم می‌گیرد:
+`LAYA_SYSTEMONE_MODE` تعیین می‌کند SystemOne چه نقشی داشته باشد:
 
-| اگر gateway شما… | مقدار | نتیجه |
+| حالت | چه اتفاقی می‌افتد | چه زمانی |
 | --- | --- | --- |
-| OpenAI-compatible | `https://api.laya.studio/v1/chat/completions` | Streaming یا JSON |
-| SystemOne gateway | `https://api.laya.studio/v1/systemone` | همان رفتار |
-| آدرس اختصاصی | `https://<host>/v1/chat/completions` | همان رفتار |
+| `off` | فقط NVIDIA. لایا هیچ تماسی نمی‌گیرد. | وقتی SystemOne آماده نیست |
+| `preflight` | اول از SystemOne راهنمای پرامپت/مدل می‌گیریم، بعد خودمان NVIDIA را صدا می‌زنیم | **پیشنهاد شروع** — کم‌ریسک‌ترین |
+| `orchestrate` | خود SystemOne مدل را صدا می‌زند؛ اگر خطا داد، خودکار روی NVIDIA fallback می‌شود | وقتی می‌خواهی لایا مالک فراخوانی باشد |
+
+برای دیدن اینکه هر درخواست با کدام مسیر جواب داده شده، هدرهای پاسخ را ببین:
+
+```
+X-Aniyab-Served-By: nvidia | systemone | laya
+X-Aniyab-Systemone: off | ok | skipped | failed
+```
+
+همچنین `GET /api/chat` کل توپولوژی را (بدون لو دادن کلید) گزارش می‌دهد.
 
 بدنه‌ای که فرستاده می‌شود:
 
@@ -103,7 +124,7 @@ vercel --prod
 ## ۴. تست بعد از Deploy
 
 ```bash
-# ۱) سلامت و تنظیمات (نباید بگوید missing)
+# ۱) سلامت و توپولوژی (configured باید true باشد)
 curl https://<your-app>.vercel.app/api/chat
 
 # ۲) استریم واقعی
@@ -125,11 +146,11 @@ curl -N -X POST https://<your-app>.vercel.app/api/chat \
 
 | کد برگشتی | معنا | کار |
 | --- | --- | --- |
-| `503 NOT_CONFIGURED` | env خالی است | متغیرها را ست و Redeploy کن |
-| `502 UNAUTHORIZED` | کلید یا scope اشتباه | `LAYA_API_KEY` و مجوز مدل در لایا |
-| `502 UPSTREAM_NOT_FOUND` | آدرس/مدل غلط | `LAYA_API_ENDPOINT` و نام مدل |
-| `429 RATE_LIMITED` | سهمیه پر شده | `Retry-After` را رعایت کن یا سهمیه بخر |
-| `504 TIMEOUT` | gateway کند است | `LAYA_TIMEOUT_MS` و پلن/ریجن |
+| `503 NOT_CONFIGURED` | هیچ ارائه‌دهنده‌ای ست نیست | `NVIDIA_API_KEY` (یا Laya) را ست و Redeploy کن |
+| `502 UNAUTHORIZED` | کلید نامعتبر/منقضی | `NVIDIA_API_KEY` را از build.nvidia.com دوباره بساز؛ پیام سرویس داخل خطای فارسی چاپ می‌شود |
+| `502 UPSTREAM_NOT_FOUND` | نام مدل غلط | `NVIDIA_MODEL` باید **دقیقاً** مطابق کاتالوگ build.nvidia.com باشد |
+| `429 RATE_LIMITED` | سهمیه/نرخ پر شده | تیر رایگان انویدیا محدود است؛ `Retry-After` را رعایت کن یا اعتبار اضافه کن |
+| `504 TIMEOUT` | مدل کند یا صف طولانی | `LLM_TIMEOUT_MS` را بالا ببر (حداکثر تا ۵۵ ثانیه) یا مدل سبک‌تر بگذار |
 | `502 NETWORK` | DNS/فایروال | اگر لایا IP ایران را بلاک می‌کند، ریجن را عوض کن |
 
 **نکته‌ی مهم درباره‌ی ریجن:** پیش‌فرض `fra1` (فرانکفورت) است چون از ایران معمولاً پایدارتر است.
@@ -149,8 +170,9 @@ curl -N -X POST https://<your-app>.vercel.app/api/chat \
 
 ## ۷. چک‌لیست قبل از انتشار عمومی
 
-- [ ] `LAYA_API_KEY` حتماً server-side و از نوع Sensitive
-- [ ] `LAYA_TIMEOUT_MS` < `maxDuration`
+- [ ] `NVIDIA_API_KEY` حتماً server-side و از نوع Sensitive
+- [ ] `LLM_TIMEOUT_MS` < `maxDuration`
+- [ ] `LAYA_SYSTEMONE_MODE` روی مقدار عمدی (`off` یا `preflight`)
 - [ ] `GET /api/chat` روی Production مقدار `configured` بدهد
 - [ ] یک گفتگو روی موبایل واقعی (فونت پیدا + RTL)
 - [ ] متن پرامپت‌های جریان‌ها با واحد کسب‌وکار نهایی شده باشد (قیمت‌ها و شماره‌ها در `FLOW_PROMPTS`)

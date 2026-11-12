@@ -1,11 +1,13 @@
 /**
- * Local stand-in for the Laya.Studio Orchestrator.
- * Mirrors both response modes so the chat route can be tested offline:
- *   POST /stream  → text/event-stream (chunked OpenAI-style deltas)
- *   POST /json    → application/json  (choices[0].message.content)
- *   POST /429     → rate-limit error
- *   POST /403     → auth error
- *   POST /slow    → never responds (timeout path)
+ * Local stand-ins for the two upstreams this app talks to.
+ *
+ *   :4100  NVIDIA NIM  — mirrors integrate.api.nvidia.com/v1/chat/completions
+ *                        (OpenAI-compatible SSE + JSON, NVIDIA error shapes)
+ *   :4200  Laya SystemOne — mirrors the orchestration/preflight gateway
+ *
+ * Fault injection is driven by the user's message so a single mock can exercise
+ * every branch of the route's error mapping:
+ *   RATE_TEST · AUTH_TEST · NOTFOUND_TEST · BOOM_TEST · SLOW_TEST
  */
 const http = require('node:http');
 
@@ -40,7 +42,8 @@ function sse(res) {
       `data: ${JSON.stringify({
         id: 'chatcmpl-mock',
         object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: { content: tokens[i] } }],
+        model: 'meta/llama-3.1-8b-instruct',
+        choices: [{ index: 0, delta: { content: tokens[i] }, finish_reason: null }],
       })}\n\n`,
     );
     i += 1;
@@ -48,55 +51,91 @@ function sse(res) {
   res.on('close', () => clearInterval(timer));
 }
 
+/** NVIDIA-shaped error envelope. */
+function nvidiaError(res, status, title, detail, headers = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+  res.end(JSON.stringify({ type: 'about:blank', title, status, detail }));
+}
+
+function readBody(req, cb) {
+  let body = '';
+  req.on('data', (c) => (body += c));
+  req.on('end', () => cb(body));
+}
+
+/* ── NVIDIA NIM mock ─────────────────────────────────────────────────────── */
 http
   .createServer((req, res) => {
     const url = req.url || '/';
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', () => {
+    readBody(req, (body) => {
       const auth = req.headers.authorization || '';
-      console.log(`[mock] ${req.method} ${url} auth=${auth.slice(0, 18)}… body=${body.length}B`);
+      console.log(`[nvidia-mock] ${req.method} ${url} auth=${auth.slice(0, 16)}… body=${body.length}B`);
+      if (url === '/v1/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ data: [{ id: 'meta/llama-3.1-8b-instruct' }] }));
+      }
 
-      // Fault injection driven by the user's message so a single mock can
-      // exercise every branch of the gateway's error mapping.
       if (body.includes('RATE_TEST')) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '7' });
-        return res.end(JSON.stringify({ error: { message: 'rate limit exceeded' } }));
+        return nvidiaError(res, 429, 'Too Many Requests', 'Rate limit exceeded. Retry later.', {
+          'Retry-After': '7',
+        });
       }
       if (body.includes('AUTH_TEST')) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: { message: 'forbidden' } }));
+        return nvidiaError(res, 401, 'Unauthorized', 'Invalid bearer token.');
       }
       if (body.includes('NOTFOUND_TEST')) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: { message: 'no such model' } }));
+        return nvidiaError(res, 404, 'Not Found', 'Model meta/does-not-exist is not available.');
       }
       if (body.includes('BOOM_TEST')) {
         res.writeHead(500, { 'Content-Type': 'text/html' });
         return res.end('<html>upstream exploded</html>');
       }
-      if (body.includes('SLOW_TEST')) return; // never respond -> timeout path
+      if (body.includes('SLOW_TEST')) return; // never respond → timeout path
 
-      if (url.startsWith('/stream')) return sse(res);
-      if (url.startsWith('/429')) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '7' });
-        return res.end(JSON.stringify({ error: { message: 'rate limit exceeded' } }));
-      }
-      if (url.startsWith('/403')) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: { message: 'forbidden' } }));
-      }
-      if (url.startsWith('/slow')) return; // never respond
-      if (url.startsWith('/json')) {
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        return res.end(
-          JSON.stringify({
-            choices: [{ index: 0, message: { role: 'assistant', content: ANSWER } }],
-          }),
-        );
-      }
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: 'not found' } }));
+      // `/json-mode` forces the non-streaming branch (tests the JSON fallback).
+      const wantsStream = body.includes('"stream":true') && !url.startsWith('/json-mode');
+      if (url.startsWith('/v1/chat/completions') && wantsStream) return sse(res);
+
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(
+        JSON.stringify({
+          id: 'chatcmpl-mock',
+          object: 'chat.completion',
+          model: 'meta/llama-3.1-8b-instruct',
+          choices: [{ index: 0, message: { role: 'assistant', content: ANSWER }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 120, completion_tokens: 240, total_tokens: 360 },
+        }),
+      );
     });
   })
-  .listen(4100, '0.0.0.0', () => console.log('mock Laya upstream on :4100'));
+  .listen(4100, '0.0.0.0', () => console.log('mock NVIDIA NIM on :4100'));
+
+/* ── Laya SystemOne mock (preflight) ─────────────────────────────────────── */
+http
+  .createServer((req, res) => {
+    readBody(req, (body) => {
+      const auth = req.headers.authorization || '';
+      console.log(`[systemone-mock] ${req.method} ${req.url} auth=${auth.slice(0, 16)}… body=${body.length}B`);
+
+      // /v1/chat/completions in orchestrate mode: deliberately down, so the route
+      // must transparently fall back to NVIDIA.
+      if ((req.url || '').startsWith('/v1/chat/completions')) {
+        return nvidiaError(res, 503, 'Service Unavailable', 'SystemOne model routing is down.');
+      }
+
+      // A preflight response: hints the route may merge into the model call.
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          session_id: 'mock',
+          hints: {
+            system_prompt: 'در پاسخ به کاربر، اگر موردی اورژانسی بود ابتدا شماره ۱۱۰ را یادآوری کن.',
+            temperature: 0.3,
+            metadata: { policy: 'aniyab-v1', routed_by: 'systemone' },
+          },
+        }),
+      );
+    });
+  })
+  .listen(4200, '0.0.0.0', () => console.log('mock Laya SystemOne on :4200'));

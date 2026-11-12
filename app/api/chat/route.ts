@@ -7,33 +7,53 @@
  *  POST /api/chat
  *  body: { messages: ChatMessage[], sessionId: string, activeFlow: AniyabFlow }
  *
- *  This handler is a *transparent proxy with guardrails* in front of the
- *  Laya.Studio Orchestrator (a.k.a. the SystemOne gateway) which fans out to
- *  NVIDIA NIM `meta/llama-3.1-8b-instruct`.
+ *  Two upstreams, two jobs:
+ *
+ *   ┌─────────────────┬──────────────────────────────────┬──────────────────┐
+ *   │ INFERENCE       │ NVIDIA NIM (integrate.api.nvidia)│ streamed tokens  │
+ *   │ ORCHESTRATION   │ Laya SystemOne (/v1/systemone)   │ session/policy   │
+ *   └─────────────────┴──────────────────────────────────┴──────────────────┘
+ *
+ *  SystemOne is optional and has three modes (`LAYA_SYSTEMONE_MODE`):
+ *    · off         (default) — NVIDIA only.
+ *    · preflight   — ask SystemOne for hints (prompt/model/temp), then call
+ *                    NVIDIA ourselves. One extra JSON round-trip, lowest risk.
+ *    · orchestrate — SystemOne owns the model call; NVIDIA becomes the
+ *                    automatic fallback when SystemOne fails or is missing.
  *
  *  Responsibilities
  *  ────────────────
  *  1. Validate & normalise the inbound payload (never trust the browser).
- *  2. Inject the system prompt for the active Aniyab business flow and the
- *     Laya `Authorization: Bearer <LAYA_API_KEY>` header.
- *  3. Forward the request upstream with a hard timeout + abort propagation.
- *  4. Inspect the upstream `Content-Type`:
+ *  2. Inject the system prompt for the active Aniyab business flow.
+ *  3. Call SystemOne (if configured) and merge its hints.
+ *  4. Forward to the model provider with a hard timeout + abort propagation.
+ *  5. Inspect the upstream `Content-Type`:
  *       • `text/event-stream`  → pipe the ReadableStream straight back to the
  *                                browser (zero buffering, zero re-encoding).
  *       • `application/json`   → parse, normalise to the OpenAI-compatible
  *                                envelope and return it.
- *  5. Map upstream failures to a stable, Persian-language JSON error contract
- *     (403 / 404 / 429 / 5xx / timeout / network).
+ *  6. Map upstream failures to a stable, Persian-language JSON error contract
+ *     (401 / 403 / 404 / 429 / 5xx / timeout / network).
  *
  *  Runtime: Node.js. The handler is runtime-agnostic (no `node:` imports), but
  *  Node + an explicit `maxDuration` gives the stream a much longer ceiling than
  *  Edge Functions do — important because `LAYA_TIMEOUT_MS` defaults to 45s.
  *  On Vercel, `maxDuration` must stay above `LAYA_TIMEOUT_MS`.
- *  Edge is still viable if you lower the upstream timeout:
- *      export const runtime = 'edge';   // then LAYA_TIMEOUT_MS <= ~25s
  */
 
 import { NextResponse } from 'next/server';
+
+import {
+  NVIDIA_DEFAULT_ENDPOINT,
+  hasLayaInference,
+  hasNvidiaKey,
+  readSystemOneHints,
+  resolveProvider,
+  systemOneConfig,
+  type ProviderId,
+  type SystemOneHints,
+  type SystemOnePreflightBody,
+} from '@/lib/llm';
 
 /* ════════════════════════════════════════════════════════════════════════════
    0. Runtime & contract types
@@ -67,6 +87,8 @@ export interface ChatRequestBody {
   messages?: unknown;
   sessionId?: unknown;
   activeFlow?: unknown;
+  /** Optional per-request provider override: 'nvidia' | 'laya'. */
+  provider?: unknown;
 }
 
 /* ── Public error contract returned to the client ─────────────────────────── */
@@ -104,14 +126,20 @@ interface ErrorBody {
    1. Tunables
    ════════════════════════════════════════════════════════════════════════════ */
 
-const UPSTREAM_TIMEOUT_MS = Number(process.env.LAYA_TIMEOUT_MS ?? 45_000);
+const UPSTREAM_TIMEOUT_MS = Number(
+  process.env.LLM_TIMEOUT_MS ?? process.env.LAYA_TIMEOUT_MS ?? 45_000,
+);
+/** SystemOne preflight is a control-plane call: keep it on a short leash. */
+const SYSTEMONE_TIMEOUT_MS = Number(process.env.LAYA_SYSTEMONE_TIMEOUT_MS ?? 6_000);
+
 const MAX_MESSAGES = 40;
 const MAX_CONTENT_CHARS = 8_000;
 const MAX_BODY_BYTES = 256 * 1024; // 256 KiB is plenty for 40 turns of text.
 
 const SUPPORT_HOTLINE = '۰۲۱-۶۲۸۰۱';
 
-const MODEL = process.env.LAYA_MODEL ?? 'meta/llama-3.1-8b-instruct';
+/** Fallback label used only when no provider resolves (see /api/chat health). */
+const MODEL = process.env.NVIDIA_MODEL ?? 'meta/llama-3.1-8b-instruct';
 
 /* ════════════════════════════════════════════════════════════════════════════
    2. System prompts — one per business flow
@@ -251,6 +279,38 @@ function parseRetryAfter(header: string | null): number | undefined {
   return undefined;
 }
 
+/**
+ * Best-effort extraction of a human-readable upstream error message.
+ * Handles NVIDIA (`{title, detail}`), OpenAI-style (`{error:{message}}`) and
+ * plain-text bodies without ever throwing.
+ */
+function extractUpstreamMessage(raw: string): string | null {
+  const text = raw.trim();
+  if (!text) return null;
+
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed === 'object' && parsed !== null) {
+      const obj = parsed as Record<string, unknown>;
+      const err = obj.error;
+      if (typeof err === 'string' && err.trim()) return err.trim().slice(0, 160);
+      if (typeof err === 'object' && err !== null) {
+        const msg = (err as Record<string, unknown>).message;
+        if (typeof msg === 'string' && msg.trim()) return msg.trim().slice(0, 160);
+      }
+      for (const key of ['detail', 'title', 'message'] as const) {
+        const value = obj[key];
+        if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 160);
+      }
+    }
+  } catch {
+    // Non-JSON body (HTML error page, plain text) — fall through.
+  }
+
+  const singleLine = text.replace(/\s+/g, ' ').trim();
+  return singleLine ? singleLine.slice(0, 160) : null;
+}
+
 /** Small non-blocking telemetry hook — swap for your real sink. */
 function logUpstream(event: string, detail: Record<string, unknown>) {
   // eslint-disable-next-line no-console
@@ -263,23 +323,6 @@ function logUpstream(event: string, detail: Record<string, unknown>) {
 
 export async function POST(request: Request): Promise<Response> {
   const startedAt = Date.now();
-
-  /* ── 5.1 Env guard ──────────────────────────────────────────────────────── */
-  const endpoint = process.env.LAYA_API_ENDPOINT?.trim();
-  const apiKey = process.env.LAYA_API_KEY?.trim();
-
-  if (!endpoint || !apiKey) {
-    logUpstream('missing_config', {
-      hasEndpoint: Boolean(endpoint),
-      hasKey: Boolean(apiKey),
-    });
-    return errorResponse(
-      503,
-      'NOT_CONFIGURED',
-      `سرویس هوشمند آنی‌یاب در حال حاضر در دسترس نیست. لطفاً چند لحظه بعد تلاش کنید یا با پشتیبانی ۲۴ ساعته ${SUPPORT_HOTLINE} تماس بگیرید.`,
-      { hint: 'ENV_MISSING' },
-    );
-  }
 
   /* ── 5.2 Body size guard (Edge: no Content-Length trust, read as text) ──── */
   let rawBody: string;
@@ -311,34 +354,140 @@ export async function POST(request: Request): Promise<Response> {
   const activeFlow: AniyabFlow = isFlow(body.activeFlow) ? body.activeFlow : 'general';
   const sessionId = sanitiseSessionId(body.sessionId);
 
-  /* ── 5.4 Build the upstream payload ─────────────────────────────────────── */
+  /* ── 5.4 Resolve the inference provider ─────────────────────────────────── */
+  // Body may carry an explicit `provider`, but only the two known ids are honoured.
+  const requestedProvider =
+    body.provider === 'nvidia' || body.provider === 'laya' ? (body.provider as ProviderId) : null;
+
+  const resolved = resolveProvider({
+    requested: requestedProvider,
+    sessionId,
+    flow: activeFlow,
+  });
+
+  if (!resolved.ok) {
+    logUpstream('missing_config', { reason: resolved.reason, nvidia: hasNvidiaKey(), laya: hasLayaInference() });
+    return errorResponse(
+      503,
+      'NOT_CONFIGURED',
+      `سرویس هوشمند آنی‌یاب در حال حاضر در دسترس نیست. لطفاً چند لحظه بعد تلاش کنید یا با پشتیبانی ۲۴ ساعته ${SUPPORT_HOTLINE} تماس بگیرید.`,
+      { hint: 'ENV_MISSING' },
+    );
+  }
+
+  let plan = resolved.plan;
+
+  /* ── 5.5 SystemOne preflight (optional) ─────────────────────────────────── */
+  // Control-plane call: short timeout, failures are non-fatal by design.
+  const systemOne = systemOneConfig();
+
+  // `orchestrate` mode: SystemOne becomes the *primary model endpoint* and NVIDIA
+  // reverts to being the fallback. This is a topology switch, not a provider hint.
+  if (systemOne.enabled && systemOne.mode === 'orchestrate' && systemOne.endpoint) {
+    plan = {
+      id: 'laya',
+      label: 'Laya SystemOne (orchestrated)',
+      endpoint: systemOne.endpoint,
+      headers: {
+        Authorization: `Bearer ${systemOne.apiKey}`,
+        Accept: 'text/event-stream, application/json;q=0.9',
+        'X-Laya-Gateway': 'systemone',
+        'X-Aniyab-Flow': activeFlow,
+        'X-Aniyab-Session': sessionId,
+      },
+      bodyExtras: plan.bodyExtras,
+    };
+  }
+  let hints: SystemOneHints = {};
+  let systemOneStatus: 'off' | 'ok' | 'skipped' | 'failed' = 'off';
+
+  if (systemOne.enabled && systemOne.mode === 'preflight' && systemOne.endpoint) {
+    const conversation = messages.filter((m) => m.role !== 'system');
+    const preflightBody: SystemOnePreflightBody = {
+      session_id: sessionId,
+      flow: activeFlow,
+      locale: 'fa-IR',
+      channel: 'aniyab-web',
+      messages: conversation.slice(-12),
+    };
+
+    const preflightController = new AbortController();
+    const preflightTimer = setTimeout(() => preflightController.abort(), SYSTEMONE_TIMEOUT_MS);
+
+    try {
+      const preflight = await fetch(systemOne.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${systemOne.apiKey}`,
+          'X-Laya-Gateway': 'systemone',
+          'X-Aniyab-Flow': activeFlow,
+          'X-Aniyab-Session': sessionId,
+        },
+        body: JSON.stringify(preflightBody),
+        signal: preflightController.signal,
+        cache: 'no-store' as RequestCache,
+      });
+
+      if (preflight.ok) {
+        const payload: unknown = await preflight.json().catch(() => null);
+        hints = readSystemOneHints(payload);
+        systemOneStatus = 'ok';
+      } else {
+        systemOneStatus = 'failed';
+        logUpstream('systemone_preflight_rejected', {
+          sessionId,
+          status: preflight.status,
+          ms: Date.now() - startedAt,
+        });
+      }
+    } catch (err) {
+      systemOneStatus = 'failed';
+      logUpstream('systemone_preflight_error', {
+        sessionId,
+        cause: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      clearTimeout(preflightTimer);
+    }
+  } else if (systemOne.enabled) {
+    // Mode 'orchestrate' handles SystemOne further down; 'off' stays silent.
+    systemOneStatus = systemOne.mode === 'orchestrate' ? 'skipped' : 'off';
+  }
+
+  /* ── 5.6 Build the upstream payload ─────────────────────────────────────── */
   // Strip any client-supplied system prompt: the server owns the persona.
   const conversation = messages.filter((m) => m.role !== 'system');
 
-  const upstreamPayload = {
-    model: MODEL,
+  // SystemOne may refine the persona; we keep our guardrails as the base and
+  // append its instructions rather than replacing them outright.
+  const systemPrompt = hints.system_prompt
+    ? `${FLOW_PROMPTS[activeFlow]}\n\n[دستور تکمیلی SystemOne]\n${hints.system_prompt}`
+    : FLOW_PROMPTS[activeFlow];
+
+  const upstreamPayload: Record<string, unknown> = {
+    ...plan.bodyExtras,
+    // A SystemOne hint may pin a different model; the provider default wins otherwise.
+    ...(hints.model && plan.id === 'nvidia' ? { model: hints.model } : {}),
     stream: true,
-    temperature: 0.4,
+    temperature: hints.temperature ?? 0.4,
     top_p: 0.9,
-    max_tokens: 1024,
-    messages: [
-      { role: 'system', content: FLOW_PROMPTS[activeFlow] },
-      ...conversation,
-    ],
-    // Laya.Studio Orchestrator routing hints (ignored by plain OpenAI gateways).
+    max_tokens: hints.max_tokens ?? 1024,
+    messages: [{ role: 'system', content: systemPrompt }, ...conversation],
     metadata: {
-      gateway: 'systemone',
-      provider: 'nvidia-nim',
-      model: MODEL,
+      gateway: systemOne.enabled ? 'systemone' : 'direct',
+      provider: plan.id === 'nvidia' ? 'nvidia-nim' : 'laya',
       flow: activeFlow,
       session_id: sessionId,
       locale: 'fa-IR',
       channel: 'aniyab-web',
       app: 'aniyab-smart-assistant',
+      ...(hints.metadata ?? {}),
     },
   };
 
-  /* ── 5.5 Abort plumbing: client disconnect + hard timeout ───────────────── */
+  /* ── 5.7 Abort plumbing: client disconnect + hard timeout ───────────────── */
   // A plain flag is used instead of `abort(reason)` — some fetch implementations
   // reject non-standard reason values, and this stays readable across runtimes.
   let abortCause: 'timeout' | 'client-closed' | null = null;
@@ -348,6 +497,28 @@ export async function POST(request: Request): Promise<Response> {
     abortCause = 'timeout';
     timeoutController.abort();
   }, UPSTREAM_TIMEOUT_MS);
+
+  /**
+   * One-shot fetch helper.
+   *
+   * The systemone→NVIDIA fallback needs a *second* fetch. Reusing one signal
+   * across two requests is unsafe: once the first response is consumed the
+   * upstream body is gone, and some runtimes tear the signal down with it.
+   * Every attempt therefore gets its own controller, linked to the shared
+   * timeout/client-close controller so cancellation still propagates.
+   */
+  const fetchWithSignal = async (url: string, init: Omit<RequestInit, 'signal'>): Promise<Response> => {
+    const attempt = new AbortController();
+    const onAbort = () => attempt.abort();
+    timeoutController.signal.addEventListener('abort', onAbort, { once: true });
+    if (timeoutController.signal.aborted) attempt.abort();
+
+    try {
+      return await fetch(url, { ...init, signal: attempt.signal });
+    } finally {
+      timeoutController.signal.removeEventListener('abort', onAbort);
+    }
+  };
 
   // If the browser closes the tab / navigates away, stop paying for tokens.
   if (request.signal) {
@@ -361,7 +532,7 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  /* ── 5.6 Call upstream ──────────────────────────────────────────────────── */
+  /* ── 5.8 Call the model provider ────────────────────────────────────────── */
   let upstream: Response;
   try {
     const requestInit: RequestInit & { duplex?: 'half' } = {
@@ -369,21 +540,17 @@ export async function POST(request: Request): Promise<Response> {
       headers: {
         'Content-Type': 'application/json',
         Accept: 'text/event-stream, application/json;q=0.9',
-        Authorization: `Bearer ${apiKey}`,
-        'X-Laya-Gateway': 'systemone',
-        'X-Aniyab-Flow': activeFlow,
-        'X-Aniyab-Session': sessionId,
+        ...plan.headers,
         'X-Request-Id': crypto.randomUUID(),
       },
       body: JSON.stringify(upstreamPayload),
       signal: timeoutController.signal,
-      // Edge runtime: cache is a no-op but explicit is better than implicit.
       cache: 'no-store' as RequestCache,
       // `duplex` is required by undici for request bodies; harmless with a string.
       duplex: 'half',
     };
 
-    upstream = await fetch(endpoint, requestInit);
+    upstream = await fetchWithSignal(plan.endpoint, requestInit);
   } catch (cause) {
     clearTimeout(timeoutId);
     const abortedByTimeout = abortCause === 'timeout';
@@ -391,6 +558,7 @@ export async function POST(request: Request): Promise<Response> {
     logUpstream(abortedByTimeout ? 'timeout' : 'network_error', {
       sessionId,
       flow: activeFlow,
+      provider: plan.id,
       ms: Date.now() - startedAt,
       cause: cause instanceof Error ? cause.message : String(cause),
     });
@@ -412,9 +580,63 @@ export async function POST(request: Request): Promise<Response> {
     return errorResponse(
       502,
       'NETWORK',
-      'ارتباط با هسته هوشمند Laya برقرار نشد. لطفاً اتصال اینترنت خود را بررسی کنید و دوباره تلاش کنید.',
+      `ارتباط با سرویس هوش مصنوعی (${plan.id === 'nvidia' ? 'NVIDIA NIM' : 'Laya'}) برقرار نشد. لطفاً اتصال اینترنت خود را بررسی کنید و دوباره تلاش کنید.`,
       { hint: 'RETRY', sessionId },
     );
+  }
+
+  /* ── 5.9 SystemOne orchestration → NVIDIA fallback ──────────────────────── */
+  // In 'orchestrate' mode SystemOne was called as the model endpoint above.
+  // If it is unusable we transparently fall back to NVIDIA so the user still
+  // gets an answer; the response headers record which path served the turn.
+  let servedBy: 'systemone' | 'nvidia' | 'laya' =
+    systemOne.enabled && systemOne.mode === 'orchestrate' && systemOne.endpoint
+      ? 'systemone'
+      : plan.id === 'laya'
+        ? 'laya'
+        : 'nvidia';
+
+  if (systemOne.enabled && systemOne.mode === 'orchestrate' && systemOne.endpoint) {
+    if (!upstream.ok && hasNvidiaKey()) {
+      logUpstream('systemone_fallback', {
+        sessionId,
+        status: upstream.status,
+        ms: Date.now() - startedAt,
+      });
+      const fallback = resolveProvider({ requested: 'nvidia', sessionId, flow: activeFlow });
+      if (fallback.ok) {
+        try {
+          // Drain the failed SystemOne response first so its socket is released
+          // before we open a second upstream connection.
+          await upstream.text().catch(() => '');
+
+          const retry = await fetchWithSignal(fallback.plan.endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'text/event-stream, application/json;q=0.9',
+              ...fallback.plan.headers,
+              'X-Request-Id': crypto.randomUUID(),
+            },
+            body: JSON.stringify({ ...upstreamPayload, ...fallback.plan.bodyExtras }),
+            cache: 'no-store' as RequestCache,
+          });
+
+          if (retry.ok) {
+            upstream = retry;
+            servedBy = 'nvidia';
+          } else {
+            await retry.text().catch(() => '');
+            logUpstream('systemone_fallback_failed', { sessionId, status: retry.status });
+          }
+        } catch (err) {
+          logUpstream('systemone_fallback_failed', {
+            sessionId,
+            cause: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
   }
 
   /* ── 5.7 Upstream HTTP error mapping ────────────────────────────────────── */
@@ -430,10 +652,17 @@ export async function POST(request: Request): Promise<Response> {
     logUpstream('upstream_error', {
       sessionId,
       flow: activeFlow,
+      provider: plan.id,
+      servedBy,
       status: upstreamStatus,
       ms: Date.now() - startedAt,
       detail: upstreamDetail,
     });
+
+    // NVIDIA returns `{"type":"...","title":"...","detail":"..."}`; Laya/OpenAI
+    // style gateways return `{"error":{"message":"..."}}`. Best-effort extraction
+    // so the operator-facing copy can name the real cause.
+    const upstreamMessage = extractUpstreamMessage(upstreamDetail);
 
     switch (upstreamStatus) {
       case 401:
@@ -441,7 +670,9 @@ export async function POST(request: Request): Promise<Response> {
         return errorResponse(
           502,
           'UNAUTHORIZED',
-          `هسته هوشمند درخواست این مرکز را نپذیرفت (کد ۴۰۳). لطفاً با پشتیبانی فنی ${SUPPORT_HOTLINE} تماس بگیرید.`,
+          `کلید دسترسی سرویس هوش مصنوعی پذیرفته نشد (کد ${toFaDigits(upstreamStatus)}).${
+            upstreamMessage ? ` جزئیات: ${upstreamMessage}` : ''
+          } لطفاً با پشتیبانی فنی ${SUPPORT_HOTLINE} تماس بگیرید.`,
           { hint: 'CONTACT_SUPPORT', upstreamStatus, sessionId },
         );
 
@@ -462,11 +693,16 @@ export async function POST(request: Request): Promise<Response> {
           { hint: 'RETRY', upstreamStatus, retryAfter, sessionId },
         );
 
+      case 402:
       case 429:
+        // NVIDIA's free tier returns 429 both for rate limits and exhausted
+        // credits, so the upstream message matters for the operator.
         return errorResponse(
           429,
           'RATE_LIMITED',
-          `تعداد درخواست‌ها زیاد است (محدودیت نرخ مصرف). لطفاً ${retryAfter ? `${toFaDigits(retryAfter)} ثانیه` : 'چند لحظه'} صبر کنید و سپس دوباره بفرستید.`,
+          `سهمیه یا محدودیت نرخ مصرف سرویس هوش مصنوعی پر شده است.${
+            upstreamMessage ? ` پیام سرویس: ${upstreamMessage.replace(/\.$/,'')}.` : ''
+          } لطفاً ${retryAfter ? `${toFaDigits(retryAfter)} ثانیه` : 'چند لحظه'} صبر کنید و دوباره بفرستید.`,
           { hint: 'WAIT', retryAfter: retryAfter ?? 20, upstreamStatus, sessionId },
         );
 
@@ -495,6 +731,9 @@ export async function POST(request: Request): Promise<Response> {
     'X-Accel-Buffering': 'no', // defeat nginx buffering on the way out
     'X-Aniyab-Session': sessionId,
     'X-Aniyab-Flow': activeFlow,
+    // Which upstream actually produced this turn — useful in production logs.
+    'X-Aniyab-Served-By': servedBy,
+    'X-Aniyab-Systemone': systemOneStatus,
   };
 
   /* ── 5.8a SSE: pipe the raw stream through unchanged ────────────────────── */
@@ -608,7 +847,11 @@ export async function POST(request: Request): Promise<Response> {
       });
     }
 
-    return successJson(answer, sessionId, activeFlow, startedAt, commonHeaders);
+    return successJson(answer, sessionId, activeFlow, startedAt, commonHeaders, {
+      servedBy,
+      model: typeof upstreamPayload.model === 'string' ? upstreamPayload.model : MODEL,
+      systemOne: systemOneStatus,
+    });
   }
 
   /* ── 5.8c Anything else (text/plain, NDJSON, …) ─────────────────────────── */
@@ -621,7 +864,11 @@ export async function POST(request: Request): Promise<Response> {
     });
   }
 
-  return successJson(plain, sessionId, activeFlow, startedAt, commonHeaders);
+  return successJson(plain, sessionId, activeFlow, startedAt, commonHeaders, {
+    servedBy,
+    model: typeof upstreamPayload.model === 'string' ? upstreamPayload.model : MODEL,
+    systemOne: systemOneStatus,
+  });
 }
 
 /** The single success envelope: OpenAI-compatible `choices` + a flat `answer`. */
@@ -631,13 +878,16 @@ function successJson(
   activeFlow: AniyabFlow,
   startedAt: number,
   headers: Record<string, string>,
+  meta: { servedBy: string; model: string; systemOne: string },
 ): NextResponse {
   return NextResponse.json(
     {
       ok: true,
       sessionId,
       activeFlow,
-      model: MODEL,
+      model: meta.model,
+      servedBy: meta.servedBy,
+      systemOne: meta.systemOne,
       latencyMs: Date.now() - startedAt,
       // OpenAI-compatible shape so the client has exactly one JSON code path…
       choices: [
@@ -655,15 +905,39 @@ function successJson(
    ════════════════════════════════════════════════════════════════════════════ */
 
 export async function GET(): Promise<Response> {
+  const systemOne = systemOneConfig();
+  const ready = hasNvidiaKey() || hasLayaInference();
+
   return NextResponse.json(
     {
-      ok: true,
+      ok: ready,
       service: 'aniyab-smart-assistant',
-      orchestrator: process.env.LAYA_API_ENDPOINT ? 'configured' : 'missing',
-      model: MODEL,
       runtime,
+      providers: {
+        inference: {
+          default: process.env.LLM_PROVIDER?.trim() || 'nvidia',
+          nvidia: {
+            configured: hasNvidiaKey(),
+            endpoint: process.env.NVIDIA_API_ENDPOINT?.trim() || NVIDIA_DEFAULT_ENDPOINT,
+            model: MODEL,
+          },
+          laya: {
+            configured: hasLayaInference(),
+            endpoint: process.env.LAYA_API_ENDPOINT?.trim() || null,
+          },
+        },
+        orchestration: {
+          systemone: {
+            configured: systemOne.enabled,
+            mode: systemOne.mode,
+            endpoint: systemOne.endpoint,
+          },
+        },
+      },
       flows: VALID_FLOWS,
-      hint: 'POST { messages, sessionId, activeFlow } به این مسیر.',
+      hint: ready
+        ? 'POST { messages, sessionId, activeFlow } به این مسیر.'
+        : 'هیچ ارائه‌دهنده‌ای تنظیم نشده است: NVIDIA_API_KEY یا LAYA_API_ENDPOINT+LAYA_API_KEY را تنظیم کنید.',
     },
     { headers: { 'Cache-Control': 'no-store' } },
   );
